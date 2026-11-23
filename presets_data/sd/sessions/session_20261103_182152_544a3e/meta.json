@@ -1,0 +1,13 @@
+{
+    "title": "см",
+    "preset": "sd",
+    "model": "gemini-3.6-flash",
+    "created_at": "2026-11-03 18:21:52",
+    "is_generating": false,
+    "last_usage": {
+        "prompt_tokens": 251,
+        "completion_tokens": 1150,
+        "cost": 0.000191
+    },
+    "last_cost": 0.000191
+}

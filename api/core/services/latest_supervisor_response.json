@@ -1,0 +1,36 @@
+{
+    "updated_at": "2026-11-17 02:53:22",
+    "language_code": "pl",
+    "run_count": 5,
+    "is_valid_json": true,
+    "raw_response": "```json\n{\n  \"evaluations\": [\n    {\"small_id\": 17, \"term\": \"Męskoosobowy: specjalne końcówki dla mężczyzn\", \"correct_count\": 6, \"incorrect_count\": 0},\n    {\"small_id\": 18, \"term\": \"Czas przeszły: końcówka oznacza osobę\", \"correct_count\": 6, \"incorrect_count\": 0},\n    {\"small_id\": 19, \"term\": \"Muszę (musisz) to twardy obowiązek\", \"correct_count\": 7, \"incorrect_count\": 0}\n  ],\n  \"errors\": [\n    {\"term\": \"Szczęśliwi rodzice oglądali\", \"sentence\": \"Szczęśliwi rodzice oglądali\"}\n  ],\n  \"explicit_unknown_words\": []\n}\n```",
+    "parsed_data": {
+        "evaluations": [
+            {
+                "small_id": 17,
+                "term": "Męskoosobowy: specjalne końcówki dla mężczyzn",
+                "correct_count": 6,
+                "incorrect_count": 0
+            },
+            {
+                "small_id": 18,
+                "term": "Czas przeszły: końcówka oznacza osobę",
+                "correct_count": 6,
+                "incorrect_count": 0
+            },
+            {
+                "small_id": 19,
+                "term": "Muszę (musisz) to twardy obowiązek",
+                "correct_count": 7,
+                "incorrect_count": 0
+            }
+        ],
+        "errors": [
+            {
+                "term": "Szczęśliwi rodzice oglądali",
+                "sentence": "Szczęśliwi rodzice oglądali"
+            }
+        ],
+        "explicit_unknown_words": []
+    }
+}

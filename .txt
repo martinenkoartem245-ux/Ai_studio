@@ -1,0 +1,11 @@
+Этот компьютер\Redmi Note 8\Внутренний общий накопитель\Download\olyh227
+Работает на апаче
+https://192.168.0.100:8443
+Сервер и фронт на 
+
+pkill httpd
+
+
+httpd
+
+ssh -r 80:localhost:8080 nokey@localhost.run

@@ -1,0 +1,13 @@
+{
+    "title": "ывыв",
+    "preset": "sd",
+    "model": "gemini-4-hydrogen",
+    "created_at": "2026-11-17 02:32:20",
+    "is_generating": false,
+    "last_usage": {
+        "prompt_tokens": 25319,
+        "completion_tokens": 1527,
+        "cost": 0.003143
+    },
+    "last_cost": 0.003143
+}

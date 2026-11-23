@@ -1,0 +1,1800 @@
+==================================================
+БЛОК ИНСТРУКЦИЙ И КОНТЕКСТА [2026-11-17 02:45:04]
+==================================================
+
+--- 1. ИТОГОВЫЙ СИСТЕМНЫЙ КОНТЕКСТ ---
+Ты — полезный ИИ-помощник.
+
+Прикреплённые файлы:
+
+
+--- ФАЙЛ: BaseHandler.php ---
+<?php
+
+declare(strict_types=1);
+
+class BaseHandler
+{
+    protected string $preset;
+    protected string $basePresetsDir;
+    protected string $presetPath;
+    protected string $languageCode = 'en';
+    protected const DICTIONARY_HISTORY_LIMIT = 10;
+
+    protected SessionService $sessionService;
+    protected FileService $fileService;
+    protected ?DictionaryService $dictionaryService = null;
+    protected ?object $aiService = null;
+
+    public function __construct(string $preset = '', ?PDO $db = null, ?object $aiService = null)
+    {
+        AppLogger::init();
+
+        $this->preset = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $preset);
+
+        $baseDir = defined('STORAGE_PATH')
+            ? STORAGE_PATH
+            : (dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'presets_data');
+
+        $this->basePresetsDir = $this->normalizeDir($baseDir);
+        $this->presetPath = $this->normalizeDir($this->basePresetsDir . ($this->preset !== '' ? $this->preset : ''));
+
+        $this->languageCode = $this->resolveLanguageFromConfig($this->presetPath);
+
+        $this->sessionService = new SessionService();
+        $this->fileService = new FileService();
+
+        $this->aiService = ($aiService !== null && method_exists($aiService, 'streamModelResponse'))
+            ? $aiService
+            : (class_exists('AiService') ? new AiService() : null);
+
+        if ($db !== null) {
+            $this->dictionaryService = new DictionaryService($db, $this->languageCode, $this->aiService);
+        }
+    }
+
+    protected function resolveLanguageFromConfig(string $presetPath): string
+    {
+        $configFile = $presetPath . 'config.json';
+        $config = $this->readJson($configFile, []);
+        $lang = strtolower((string)($config['language'] ?? 'en'));
+        return in_array($lang, ['en', 'pl'], true) ? $lang : 'en';
+    }
+
+    protected function normalizeDir(string $path): string
+    {
+        return rtrim($path, '\\/') . DIRECTORY_SEPARATOR;
+    }
+
+    protected function readJson(string $filePath, array $default = []): array
+    {
+        if (!file_exists($filePath)) {
+            return $default;
+        }
+        $data = JsonStorage::read($filePath, $default);
+        return is_array($data) ? $data : $default;
+    }
+
+    protected function writeJson(string $filePath, array $data): bool
+    {
+        return JsonStorage::write($filePath, $data);
+    }
+
+    public function getSystemPrompt(string $sessionPath): string
+    {
+        $config = $this->readJson($this->presetPath . 'config.json');
+
+        if (is_string($config['system_prompt'] ?? null) && !empty($config['system_prompt'])) {
+            return $config['system_prompt'];
+        }
+
+        return "Ты — полезный ИИ-помощник.";
+    }
+
+    public function afterMessageSent(string $sessionPath): void {}
+
+    public function handleAction(string $action, Request $request): void
+    {
+        // 1. Подтягиваем preset ДО роутинга экшенов и актуализируем язык словаря
+        $reqPreset = $request->getString('preset');
+        if (!empty($reqPreset)) {
+            $this->preset = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $reqPreset);
+            $this->presetPath = $this->normalizeDir($this->basePresetsDir . $this->preset);
+            
+            $this->languageCode = $this->resolveLanguageFromConfig($this->presetPath);
+            if ($this->dictionaryService !== null) {
+                $this->dictionaryService->setLanguageCode($this->languageCode);
+            }
+        }
+
+        // Логирование HTTP-запроса с актуальным presetPath
+        AppLogger::info('http_requests', "Action: {$action}", [
+            'action' => $action,
+            'preset' => $this->preset,
+            'ip'     => $_SERVER['REMOTE_ADDR'] ?? 'cli',
+            'get'    => $_GET,
+            'post'   => $_POST
+        ]);
+
+        if ($action === 'send_message') {
+            $this->sendMessage($request);
+            return;
+        }
+
+        if ($action === 'get_structure') {
+            Response::json(['presets' => $this->sessionService->getStructure($this->basePresetsDir)]);
+            return;
+        }
+
+        if ($action === 'create_session' || $action === 'create') {
+            try {
+                $title = $request->getString('title', $request->getString('name', ''));
+                $sessionId = $this->sessionService->createSession($this->presetPath, $this->preset, $title);
+
+                Response::json([
+                    'status'  => 'success',
+                    'session' => $sessionId,
+                    'preset'  => $this->preset
+                ]);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка создания сессии', ['error' => $e->getMessage()]);
+                Response::error('Ошибка создания сессии: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+        if ($action === 'get_notes') {
+            try {
+                $notesFile = $this->basePresetsDir . 'global_notes.json';
+                $data = $this->readJson($notesFile, ['notes' => []]);
+                Response::json([
+                    'status' => 'success',
+                    'notes'  => $data['notes'] ?? []
+                ]);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка чтения заметок', ['error' => $e->getMessage()]);
+                Response::error('Ошибка чтения заметок: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+
+        if ($action === 'save_notes') {
+            try {
+                $notesFile = $this->basePresetsDir . 'global_notes.json';
+                
+                // Читаем тело запроса (JSON или POST)
+                $rawBody = file_get_contents('php://input');
+                $payload = json_decode($rawBody, true);
+                
+                $notes = null;
+                if (is_array($payload) && isset($payload['notes'])) {
+                    $notes = $payload['notes'];
+                } else {
+                    $notesRaw = $request->getString('notes', '');
+                    $notes = json_decode($notesRaw, true);
+                }
+
+                if (!is_array($notes)) {
+                    Response::error('Неверный формат данных заметок', 400);
+                    return;
+                }
+
+                $this->writeJson($notesFile, [
+                    'notes'      => $notes,
+                    'updated_at' => date('c')
+                ]);
+
+                Response::json(['status' => 'success', 'notes' => $notes]);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка сохранения заметок', ['error' => $e->getMessage()]);
+                Response::error('Ошибка сохранения заметок: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+
+
+        if ($action === 'create_preset') {
+            try {
+                $presetName = $request->getString('preset_name');
+                $model = $request->getString('model', 'kimi-k3');
+                $hasDict = $request->getString('has_dictionary') === '1';
+
+                if (empty(trim($presetName))) {
+                    Response::error('Название пресета не может быть пустым', 400);
+                    return;
+                }
+
+                $result = $this->sessionService->createPreset($this->basePresetsDir, $presetName, $model, $hasDict);
+
+                Response::json([
+                    'status'     => 'success',
+                    'preset_id'  => $result['preset_id'],
+                    'session_id' => $result['session_id']
+                ]);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка создания пресета', ['error' => $e->getMessage()]);
+                Response::error('Ошибка создания пресета: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+
+        if ($action === 'delete_preset') {
+            try {
+                $presetToDelete = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $request->getString('preset'));
+                if (empty($presetToDelete)) {
+                    Response::error('Параметр preset не указан', 400);
+                    return;
+                }
+                $res = $this->sessionService->deletePreset($this->basePresetsDir, $presetToDelete);
+                Response::json(['status' => $res ? 'success' : 'error']);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка удаления пресета', ['error' => $e->getMessage()]);
+                Response::error('Ошибка удаления пресета: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+
+        $rawSession = $request->getString('session',
+                        $request->getString('session_id',
+                        $request->getString('sessionId',
+                        $request->getString('id'))));
+
+        $session = preg_replace('/[^\p{L}\p{N}_\-]/u', '', (string)$rawSession);
+
+        if (empty($session)) {
+            Response::error('Параметр session не указан или имеет неверный формат', 400);
+            return;
+        }
+
+        $path = $this->normalizeDir($this->presetPath . 'sessions' . DIRECTORY_SEPARATOR . $session);
+
+        switch ($action) {
+            case 'update_session_model':
+            case 'set_model':
+            case 'update_session':
+            case 'update_meta':
+                $meta = $this->readJson($path . 'meta.json', []);
+                $model = $request->getString('model', $request->getString('model_id'));
+
+                if (!empty($model)) {
+                    $meta['model'] = $model;
+                    $this->writeJson($path . 'meta.json', $meta);
+                }
+
+                Response::json([
+                    'status'  => 'success',
+                    'session' => $session,
+                    'model'   => $model,
+                    'meta'    => $meta
+                ]);
+                break;
+
+            case 'delete_session':
+                $res = $this->sessionService->deleteSession(rtrim($path, DIRECTORY_SEPARATOR));
+                Response::json(['status' => $res ? 'success' : 'error']);
+                break;
+
+            case 'get_session_data':
+                $meta = $this->readJson($path . 'meta.json', []);
+                $config = $this->readJson($this->presetPath . 'config.json', []);
+                $rawHistory = $this->readJson($path . 'chat_history.json', []);
+                
+                $files = $this->fileService->getSessionFiles($path);
+
+                Response::json([
+                    'config'  => $config,
+                    'meta'    => $meta,
+                    'history' => array_values($rawHistory),
+                    'files'   => $files
+                ]);
+                break;
+
+            case 'upload_file':
+            case 'upload_files':
+                if (empty($_FILES['files'] ?? $_FILES['file'] ?? null)) {
+                    Response::error('Файлы не переданы в запросе', 400);
+                    return;
+                }
+                
+                $filesData = $_FILES['files'] ?? $_FILES['file'];
+                $result = $this->fileService->uploadFiles($path, $filesData);
+                
+                if ($result['status'] === 'error') {
+                    Response::error($result['message'], 400);
+                } else {
+                    Response::json($result);
+                }
+                break;
+
+            case 'delete_file':
+                $fileName = $request->getString('file', $request->getString('filename', ''));
+                if (empty($fileName)) {
+                    Response::error('Не указано имя файла для удаления', 400);
+                    return;
+                }
+
+                $deleted = $this->fileService->deleteFile($path, $fileName);
+                Response::json([
+                    'status'  => $deleted ? 'success' : 'error',
+                    'message' => $deleted ? 'Файл успешно удалён' : 'Не удалось удалить файл'
+                ]);
+                break;
+
+            case 'watch_session':
+                $this->watchSession($request);
+                return;
+
+            case 'get_dictionary':
+                $dictData = ($this->dictionaryService !== null)
+                    ? $this->dictionaryService->getDictionaryData()
+                    : ['master' => [], 'active_buffer' => []];
+
+                Response::json([
+                    'status'     => 'success',
+                    'dictionary' => $dictData
+                ]);
+                break;
+
+            case 'add_word':
+                $word = $request->getString('word', $request->getString('term', ''));
+                $category = $request->getString('category', 'B1_B2');
+
+                if (empty(trim($word))) {
+                    Response::error('Слово или термин не может быть пустым', 400);
+                    return;
+                }
+
+                if ($this->dictionaryService === null) {
+                    Response::error('Служба словаря недоступна (нет подключения к БД)', 500);
+                    return;
+                }
+
+                $success = $this->dictionaryService->addWord($word, $category);
+                
+                if (!$success) {
+                    Response::error('Не удалось добавить слово в словарь', 500);
+                    return;
+                }
+
+                $dictData = $this->dictionaryService->getDictionaryData();
+
+                Response::json([
+                    'status'     => 'success',
+                    'dictionary' => $dictData
+                ]);
+                break;
+
+            default:
+                Response::error('Unknown action: ' . $action, 404);
+                break;
+        }
+    }
+
+public function sendMessage(Request $request): void {
+    // Скрипт не прерывается при отключении клиента
+    ignore_user_abort(true);
+    set_time_limit(300);
+
+    SseResponse::init();
+
+    $rawSession = $request->getString('session');
+    $message    = $request->getString('message');
+
+    if ($rawSession === '') {
+        SseResponse::error('Параметр session отсутствует или пуст.');
+        return;
+    }
+
+    if (trim($message) === '') {
+        SseResponse::error('Параметр message отсутствует или пуст.');
+        return;
+    }
+
+    $session = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $rawSession);
+    if ($session === '') {
+        SseResponse::error('Параметр session содержит недопустимые символы.');
+        return;
+    }
+
+    $sessionPath = $this->normalizeDir($this->presetPath . 'sessions' . DIRECTORY_SEPARATOR . $session);
+    if (!is_dir($sessionPath)) {
+        SseResponse::error('Сессия не найдена: ' . $sessionPath);
+        return;
+    }
+
+    if ($this->sessionService->isGenerating($sessionPath)) {
+        SseResponse::error('Сессия уже обрабатывает запрос.');
+        return;
+    }
+
+    $this->sessionService->setGeneratingStatus($sessionPath, true);
+
+    // Буферы для накопления ответа
+    $textAccumulator      = '';
+    $thinkingAccumulator  = '';
+    $lastUsage            = [];
+    $activeModel          = '';
+    $isAssistantCommitted = false;
+
+    $historyFile = $sessionPath . 'chat_history.json';
+
+    // ЭТАП 1: сразу записываем сообщение пользователя на диск
+    $fullHistory   = $this->readJson($historyFile, []);
+    $fullHistory[] = [
+        'role'      => 'user',
+        'content'   => $message,
+        'timestamp' => date('Y-m-d H:i:s')
+    ];
+    $fullHistory = array_values($fullHistory);
+    $this->writeJson($historyFile, $fullHistory);
+
+    // Аварийный предохранитель на случай фатальной ошибки или таймаута
+    register_shutdown_function(function () use (
+        &$isAssistantCommitted,
+        $sessionPath,
+        $historyFile,
+        &$fullHistory,
+        &$textAccumulator,
+        &$thinkingAccumulator,
+        &$lastUsage,
+        &$activeModel
+    ) {
+        if (!$isAssistantCommitted && (!empty($textAccumulator) || !empty($thinkingAccumulator))) {
+            $this->commitAssistantMessage(
+                $sessionPath,
+                $historyFile,
+                $fullHistory,
+                $textAccumulator,
+                $thinkingAccumulator,
+                $lastUsage,
+                $activeModel
+            );
+            $isAssistantCommitted = true;
+        }
+        $this->sessionService->setGeneratingStatus($sessionPath, false);
+    });
+
+    try {
+        $meta   = $this->readJson($sessionPath . 'meta.json', []);
+        $config = $this->readJson($this->presetPath . 'config.json', []);
+
+        $mergedDefaults = array_merge($config, $meta);
+        $params = AiParamNormalizer::extract($request, $mergedDefaults);
+
+        $requestedModel     = !empty($params['model']) ? $params['model'] : ($config['model'] ?? 'gemini-3.6-flash');
+        $modelFallbackChain = $this->getModelFallbackChain($requestedModel);
+
+        $systemContext = $this->buildSystemContext($sessionPath, $params['system_context'] ?? '');
+        $apiHistory    = $this->buildApiHistory(  $this->limitHistoryForModel($fullHistory, $config));
+
+
+        if (class_exists('InstructionLogger')) {
+            InstructionLogger::log($sessionPath, $systemContext, $apiHistory, $params);
+        }
+
+        $generationSuccess  = false;
+        $lastException      = null;
+        $chunksSentToClient = false;
+
+        if ($this->aiService !== null) {
+            foreach ($modelFallbackChain as $attempt => $currentModel) {
+                try {
+                    AppLogger::info('ai_service', 'Запрос к ИИ (попытка ' . ($attempt + 1) . ')', [
+                        'session' => $session,
+                        'model'   => $currentModel
+                    ]);
+
+                    if ($attempt > 0) {
+                        if ($chunksSentToClient && !connection_aborted()) {
+                            SseResponse::send('reset_stream', [
+                                'reason'  => 'model_fallback',
+                                'message' => "Предыдущая модель сбоила. Начинаем заново на {$currentModel}..."
+                            ]);
+                        }
+
+                        if (!connection_aborted()) {
+                            SseResponse::send('system_notice', [
+                                'message' => "Основная модель недоступна. Переключаемся на {$currentModel}..."
+                            ]);
+                        }
+
+                        $textAccumulator     = '';
+                        $thinkingAccumulator = '';
+                        $chunksSentToClient  = false;
+                    }
+
+                    $params['model'] = $currentModel;
+
+                    $this->aiService->streamModelResponse(
+                        $currentModel,
+                        $systemContext,
+                        $apiHistory,
+                        $params,
+                        function ($type, $chunk) use (
+                            &$textAccumulator,
+                            &$thinkingAccumulator,
+                            &$lastUsage,
+                            &$chunksSentToClient,
+                            $currentModel
+                        ){
+                            // Накопление на сервере происходит всегда
+                            if ($type === 'text' && is_string($chunk)) {
+                                $textAccumulator .= $chunk;
+                                $chunksSentToClient = true;
+                            } elseif ($type === 'thinking' && is_string($chunk)) {
+                                $thinkingAccumulator .= $chunk;
+                                $chunksSentToClient = true;
+                            } elseif ($type === 'usage' && is_array($chunk)) {
+                                [$pTokens, $cTokens] = class_exists('CostCalculator')
+                                    ? CostCalculator::extractTokens($chunk)
+                                    : [(int)($chunk['prompt_tokens'] ?? 0), (int)($chunk['completion_tokens'] ?? 0)];
+
+                                $cost = class_exists('CostCalculator')
+                                    ? CostCalculator::calculate($currentModel, $pTokens, $cTokens)
+                                    : 0;
+
+                                $lastUsage = [
+                                    'prompt_tokens'     => $pTokens,
+                                    'completion_tokens' => $cTokens,
+                                    'cost'              => $cost
+                                ];
+                                $chunk = $lastUsage;
+                            }
+
+                            // Отправляем клиенту только если он ещё на связи
+                            if (!connection_aborted()) {
+                                SseResponse::send($type, is_array($chunk) ? $chunk : ['chunk' => $chunk]);
+                            }
+                        },
+                        $sessionPath
+                    );
+
+                    $generationSuccess = true;
+                    $activeModel       = $currentModel;
+                    break;
+
+                } catch (\Throwable $aiErr) {
+                    $lastException = $aiErr;
+                    AppLogger::error('ai_service', "Сбой модели {$currentModel}", [
+                        'session' => $session,
+                        'attempt' => $attempt + 1,
+                        'error'   => $aiErr->getMessage()
+                    ]);
+
+                    usleep((int)(pow(2, $attempt) * 300000));
+                }
+            }
+
+            if (!$generationSuccess) {
+                throw new \RuntimeException(
+                    'Все модели из цепочки fallback недоступны. Последняя ошибка: ' .
+                    ($lastException ? $lastException->getMessage() : 'Unknown error')
+                );
+            }
+        }
+
+        // ЭТАП 2: фиксация ответа ассистента
+        $fullHistory = $this->commitAssistantMessage(
+            $sessionPath,
+            $historyFile,
+            $fullHistory,
+            $textAccumulator,
+            $thinkingAccumulator,
+            $lastUsage,
+            $activeModel
+        );
+        $isAssistantCommitted = true;
+
+        if (!connection_aborted()) {
+            SseResponse::send('done', [
+                'status'  => 'completed',
+                'history' => $fullHistory
+            ]);
+        }
+
+        // Фоновые задачи (словарь и т.п.)
+        $cleanText = preg_replace('/(```thinking\r?\n.*?\r?\n```\r?\n*|<think>.*?<\/think>)/s', '', $textAccumulator);
+        $cleanText = trim((string)$cleanText);
+
+        if ($cleanText !== '') {
+            $this->runPostResponseTasks($sessionPath, $message, $cleanText, $fullHistory);
+        }
+
+    } catch (\Throwable $e) {
+        AppLogger::error('sse_stream', 'Ошибка при генерации', [
+            'session' => $session,
+            'error'   => $e->getMessage()
+        ]);
+
+        // Если модель успела что-то сгенерировать до ошибки, сохраняем это
+        if (!$isAssistantCommitted && (!empty($textAccumulator) || !empty($thinkingAccumulator))) {
+            $fullHistory = $this->commitAssistantMessage(
+                $sessionPath,
+                $historyFile,
+                $fullHistory,
+                $textAccumulator,
+                $thinkingAccumulator,
+                $lastUsage,
+                $activeModel
+            );
+            $isAssistantCommitted = true;
+        }
+
+        if (!connection_aborted()) {
+            SseResponse::send('error', [
+                'message' => 'Ошибка при генерации: ' . $e->getMessage()
+            ]);
+        }
+    } finally {
+        $this->sessionService->setGeneratingStatus($sessionPath, false);
+    }
+}
+
+    /**
+     * Изолированный атомарный метод записи ответа ассистента в файл
+     */
+    protected function commitAssistantMessage(
+        string $sessionPath,
+        string $historyFile,
+        array $fullHistory,
+        string $textAccumulator,
+        string $thinkingAccumulator,
+        array $lastUsage,
+        string $activeModel
+    ): array {
+        $cleanText = preg_replace('/(```thinking\r?\n.*?\r?\n```\r?\n*|<think>.*?<\/think>)/s', '', $textAccumulator);
+        $cleanText = trim((string)$cleanText);
+
+        // Если текста нет, но было мышление (или была ошибка)
+        if ($cleanText === '' && empty($thinkingAccumulator)) {
+            return $fullHistory;
+        }
+
+        $assistantMessage = [
+            'role'      => 'assistant',
+            'content'   => $cleanText,
+            'timestamp' => date('Y-m-d H:i:s')
+        ];
+
+        if (!empty($thinkingAccumulator)) {
+            $assistantMessage['reasoning_content'] = trim($thinkingAccumulator);
+        }
+
+        $fullHistory[] = $assistantMessage;
+        $fullHistory = array_values($fullHistory);
+
+        // Запись истории на диск
+        $this->writeJson($historyFile, $fullHistory);
+
+        // Обновление метаданных сессии
+        $metaFile = $sessionPath . 'meta.json';
+        $meta = $this->readJson($metaFile, []);
+        
+        if (!empty($activeModel)) {
+            $meta['model'] = $activeModel;
+        }
+        if (!empty($lastUsage)) {
+            $meta['last_usage'] = $lastUsage;
+            $meta['last_cost'] = $lastUsage['cost'] ?? 0;
+        }
+        $meta['is_generating'] = false;
+        $this->writeJson($metaFile, $meta);
+
+        return $fullHistory;
+    }
+
+    protected function getModelFallbackChain(string $requestedModel): array
+    {
+        $chain = [$requestedModel];
+
+        $fallbackMap = [
+            'gemini-3.6-flash'   => ['gemini-3.7-flash', 'gemini-3.8-flash'],
+            'claude-sonnet-5-5'  => ['kimi-k3'],
+            'claude-haiku-5-5'   => ['kimi-k2.6'],
+            'kimi-k3.1-pro'            => [],
+            'kimi-k2.6'          => ['claude-haiku-5-5'],
+            'claude-opus-5-5'    => [],
+        ];
+
+        if (isset($fallbackMap[$requestedModel])) {
+            foreach ($fallbackMap[$requestedModel] as $fallback) {
+                if (!in_array($fallback, $chain, true)) {
+                    $chain[] = $fallback;
+                }
+            }
+        } else {
+            if (!in_array('gemini-3.5-flash-lite', $chain, true)) {
+                $chain[] = 'gemini-3.5-flash-lite';
+            }
+        }
+
+        return array_unique($chain);
+    }
+
+protected function runPostResponseTasks(
+    string $sessionPath,
+    string $message,
+    string $cleanText,
+    array $fullHistory
+): void {
+    if (function_exists('fastcgi_finish_request')) {
+        fastcgi_finish_request();
+    } else {
+        if (ob_get_level() > 0) {
+            @ob_end_flush();
+        }
+        @flush();
+    }
+
+    ignore_user_abort(true);
+    set_time_limit(180);
+
+    // 🟢 ИСПРАВЛЕНИЕ: Проверяем, включен ли словарь для этого пресета
+    $config = $this->readJson($this->presetPath . 'config.json', []);
+    $hasDictionary = (bool)($config['has_dictionary'] ?? false);
+
+    if ($hasDictionary && $this->dictionaryService !== null) {
+        try {
+            $this->dictionaryService->handleInteraction($message, $cleanText, $fullHistory);
+        } catch (\Throwable $dictEx) {
+            AppLogger::error('background', 'DictionaryService error: ' . $dictEx->getMessage(), [
+                'session' => $sessionPath
+            ]);
+        }
+    }
+
+    try {
+        $this->afterMessageSent($sessionPath);
+    } catch (\Throwable $subEx) {
+        AppLogger::error('background', 'Supervisor Error: ' . $subEx->getMessage(), [
+            'file' => $subEx->getFile(),
+            'line' => $subEx->getLine()
+        ]);
+    }
+}
+
+
+
+    protected function buildSystemContext(string $sessionPath, string $customSystemPrompt = '', string $summary = ''): string
+{
+    $config = $this->readJson($this->presetPath . 'config.json', []);
+    $hasDictionary = (bool)($config['has_dictionary'] ?? false);
+
+    $systemContext = !empty($customSystemPrompt)
+        ? $customSystemPrompt
+        : $this->getSystemPrompt($sessionPath);
+
+    if ($hasDictionary && $this->dictionaryService !== null) {
+        $smallDict = $this->dictionaryService->getDictionary();
+        if (!empty($smallDict)) {
+            $systemContext .= "\n\nАКТИВНЫЙ МАЛЫЙ СЛОВАРЬ (используй эти слова, правила и выражения в диалоге, проверяй их употребление. Можешь подталкивать ученика к их использованию):\n" .
+                              json_encode($smallDict, JSON_UNESCAPED_UNICODE);
+        }
+
+        // 🟢 ИСПРАВЛЕНИЕ: Подтягиваем опечатки/целевые слова из typo_queue для подсказки модели
+        $pendingTypos = $this->dictionaryService->getPendingTyposForPrompt();
+        if (!empty($pendingTypos)) {
+            $systemContext .= "\n\nЦЕЛЕВЫЕ СЛОВА/ОПЕЧАТКИ ДЛЯ ПРОВЕРКИ (мягко и естественно подталкивай ученика использовать их в диалоге, если уместно):\n" .
+                              json_encode($pendingTypos, JSON_UNESCAPED_UNICODE);
+        }
+    }
+
+    if (!empty($summary)) {
+        $systemContext = "КРАТКАЯ ПРЕДЫСТОРИЯ ДИАЛОГА:\n" . $summary . "\n\n" . $systemContext;
+    }
+
+    if ($filesContext = $this->fileService->getSessionFilesContext($sessionPath)) {
+        $systemContext .= "\n\nПрикреплённые файлы:\n" . $filesContext;
+    }
+
+    return $systemContext;
+}
+
+   protected function buildApiHistory(array $recentHistory): array
+{
+    return array_map(function ($m) {
+        $item = [
+            'role'    => (($m['role'] ?? '') === 'user') ? 'user' : 'assistant',
+            'content' => (string)($m['content'] ?? '')
+        ];
+
+        // 🟢 ОЧЕНЬ ВАЖНО: протаскиваем timestamp дальше!
+        if (!empty($m['timestamp'])) {
+            $item['timestamp'] = $m['timestamp'];
+        }
+
+        if (!empty($m['reasoning_content']) && is_string($m['reasoning_content'])) {
+            $item['reasoning_content'] = $m['reasoning_content'];
+        }
+        return $item;
+    }, $recentHistory);
+}
+
+
+    public function watchSession(Request $request): void
+    {
+        SseResponse::init();
+
+        $session = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $request->getString('session'));
+        $sessionPath = $this->normalizeDir($this->presetPath . 'sessions' . DIRECTORY_SEPARATOR . $session);
+        $historyFile = $sessionPath . 'chat_history.json';
+
+        if (empty($session) || !is_dir($sessionPath)) {
+            SseResponse::error('Сессия не найдена');
+            return;
+        }
+
+        $lastMtime = file_exists($historyFile) ? filemtime($historyFile) : 0;
+        $start = time();
+        $maxDuration = 50; 
+
+        while ((time() - $start) < $maxDuration) {
+            if (connection_aborted()) {
+                break;
+            }
+
+            clearstatcache(true, $historyFile);
+            $currentMtime = file_exists($historyFile) ? filemtime($historyFile) : 0;
+
+            if ($currentMtime > $lastMtime) {
+                $lastMtime = $currentMtime;
+                $history = $this->readJson($historyFile, []);
+                
+                SseResponse::send('history_updated', [
+                    'history' => array_values($history)
+                ]);
+            }
+
+            SseResponse::ping();
+            sleep(1);
+        }
+
+        SseResponse::send('reconnect', ['status' => 'timeout']);
+    }
+    protected function limitHistoryForModel(array $history, array $config): array
+{
+    $hasDictionary = (bool)($config['has_dictionary'] ?? false);
+    if (!$hasDictionary) {
+        return $history;
+    }
+
+    $limit = (int)($config['history_limit'] ?? self::DICTIONARY_HISTORY_LIMIT);
+    if ($limit <= 0 || count($history) <= $limit) {
+        return $history;
+    }
+
+    $limited = array_slice($history, -$limit);
+
+    // Диалог должен начинаться с сообщения пользователя
+    if (($limited[0]['role'] ?? '') !== 'user') {
+        array_shift($limited);
+    }
+
+    return array_values($limited);
+}
+
+}
+
+--- ФАЙЛ: DictionaryService.php ---
+<?php
+
+declare(strict_types=1);
+
+class DictionaryService 
+{
+    private PDO $db;
+    private string $languageCode;
+    private ?object $aiService;
+    private string $supervisorLogFile;
+
+    public function __construct(
+        PDO $db, 
+        string $languageCode = 'en',
+        ?object $aiService = null, 
+        string $supervisorLogFile = __DIR__ . '/latest_supervisor_response.json'
+    ) {
+        $this->db = $db;
+        $this->languageCode = in_array(strtolower($languageCode), ['en', 'pl'], true) ? strtolower($languageCode) : 'en';
+        $this->aiService = $aiService ?? (class_exists('AiService') ? new AiService() : null);
+        $this->supervisorLogFile = $supervisorLogFile;
+    }
+
+    public function setLanguageCode(string $languageCode): self 
+    {
+        $this->languageCode = in_array(strtolower($languageCode), ['en', 'pl'], true) ? strtolower($languageCode) : 'en';
+        return $this;
+    }
+
+    public function getDictionary(): array 
+    {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT dm.id, dm.term, dm.category, dm.item_type, ds.score 
+                FROM dictionary_small ds
+                JOIN dictionary_master dm ON ds.master_id = dm.id
+                WHERE dm.language_code = :lang
+                ORDER BY ds.id ASC
+            ");
+            $stmt->execute([':lang' => $this->languageCode]);
+            return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        } catch (\Throwable $e) {
+            $this->logError('getDictionary Error', $e);
+            return [];
+        }
+    }
+
+    public function handleInteraction(string $userMessage, string $lightModelResponse, array $recentHistory = []): array 
+    {
+        try {
+            // Атомарный Upsert счетчика сообщений под конкретный язык
+            $stmtMetaUpdate = $this->db->prepare("
+                INSERT INTO user_meta (language_code, user_message_count, supervisor_run_count)
+                VALUES (:lang, 1, 0)
+                ON DUPLICATE KEY UPDATE user_message_count = user_message_count + 1
+            ");
+            $stmtMetaUpdate->execute([':lang' => $this->languageCode]);
+
+            $stmtMetaSelect = $this->db->prepare("
+                SELECT user_message_count, supervisor_run_count 
+                FROM user_meta 
+                WHERE language_code = :lang
+            ");
+            $stmtMetaSelect->execute([':lang' => $this->languageCode]);
+            $meta = $stmtMetaSelect->fetch(PDO::FETCH_ASSOC);
+            
+            $userMsgCount = (int)($meta['user_message_count'] ?? 0);
+            $supervisorRunCount = (int)($meta['supervisor_run_count'] ?? 0);
+
+            // 1. Проверяем опечатки из карантина Active Recall
+            $this->processTypoQueue($userMsgCount, $userMessage);
+
+            $supervisorTriggered = false;
+
+            // 2. Каждые 10 сообщений запускаем супервайзер
+            if ($userMsgCount > 0 && $userMsgCount % 10 === 0) {
+                $supervisorRunCount++;
+                $stmt = $this->db->prepare("
+                    UPDATE user_meta 
+                    SET supervisor_run_count = :cnt 
+                    WHERE language_code = :lang
+                ");
+                $stmt->execute([':cnt' => $supervisorRunCount, ':lang' => $this->languageCode]);
+                
+                $this->runSupervisorCycle($supervisorRunCount, $recentHistory);
+                $supervisorTriggered = true;
+            }
+
+            $this->rebuildSmallDictionary();
+
+            return [
+                'ai_response' => $lightModelResponse,
+                'supervisor_run' => $supervisorTriggered,
+                'message_count' => $userMsgCount
+            ];
+        } catch (\Throwable $e) {
+            $this->logError('handleInteraction Error', $e);
+            return ['ai_response' => $lightModelResponse, 'supervisor_run' => false, 'message_count' => 0];
+        }
+    }
+
+    public function getPendingTyposForPrompt(): array 
+    {
+        try {
+            $stmtCount = $this->db->prepare("SELECT user_message_count FROM user_meta WHERE language_code = :lang");
+            $stmtCount->execute([':lang' => $this->languageCode]);
+            $currentMsgCount = (int)$stmtCount->fetchColumn();
+            
+            $stmt = $this->db->prepare("
+                SELECT expected_word 
+                FROM typo_queue 
+                WHERE language_code = :lang AND check_at_message <= :next_msg
+            ");
+            $stmt->execute([
+                ':lang'     => $this->languageCode,
+                ':next_msg' => $currentMsgCount + 1
+            ]);
+            
+            return $stmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+        } catch (\Throwable $e) {
+            $this->logError('getPendingTyposForPrompt failed', $e);
+            return [];
+        }
+    }
+
+    public function rebuildSmallDictionary(): void 
+    {
+        try {
+            $stmtCount = $this->db->prepare("
+                SELECT COUNT(*) 
+                FROM dictionary_small ds
+                JOIN dictionary_master dm ON ds.master_id = dm.id
+                WHERE dm.language_code = :lang
+            ");
+            $stmtCount->execute([':lang' => $this->languageCode]);
+            $currentCount = (int)$stmtCount->fetchColumn();
+
+            if ($currentCount >= 10) {
+                return;
+            }
+
+            $needed = 10 - $currentCount;
+
+            // 1. Извлекаем слова со статусом 'new', которых еще нет в dictionary_small
+            $stmt = $this->db->prepare("
+                SELECT dm.id 
+                FROM dictionary_master dm
+                LEFT JOIN dictionary_small ds ON dm.id = ds.master_id
+                WHERE dm.language_code = :lang 
+                  AND dm.status = 'new' 
+                  AND ds.master_id IS NULL
+                ORDER BY dm.id ASC 
+                LIMIT :limit
+            ");
+            $stmt->bindValue(':lang', $this->languageCode);
+            $stmt->bindValue(':limit', $needed, PDO::PARAM_INT);
+            $stmt->execute();
+            $newWords = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+            if (!empty($newWords)) {
+                $idsToAdd = array_map('intval', $newWords);
+                $this->addToSmallDict($idsToAdd);
+                $needed -= count($idsToAdd);
+            }
+
+            // 2. Если все еще нужен добор, извлекаем раннее практиковавшиеся слова (status != 'mastered')
+            if ($needed > 0) {
+                $stmt = $this->db->prepare("
+                    SELECT dm.id, dm.term, dm.last_practiced_at 
+                    FROM dictionary_master dm
+                    LEFT JOIN dictionary_small ds ON dm.id = ds.master_id
+                    WHERE dm.language_code = :lang 
+                      AND dm.status != 'mastered' 
+                      AND ds.master_id IS NULL
+                    ORDER BY dm.last_practiced_at IS NULL DESC, dm.last_practiced_at ASC
+                    LIMIT 20
+                ");
+                $stmt->execute([':lang' => $this->languageCode]);
+                $candidates = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                if (!empty($candidates)) {
+                    $selectedIds = $this->selectOldestPracticedViaAi($candidates, $needed);
+                    if (!empty($selectedIds)) {
+                        $this->addToSmallDict($selectedIds);
+                        $needed -= count($selectedIds);
+                    }
+                }
+            }
+
+            // 3. Если в master не хватило словаря — генерируем бизнес-лексику
+            if ($needed > 0) {
+                $this->generateAndInjectVocabulary($needed);
+            }
+        } catch (\Throwable $e) {
+            $this->logError('rebuildSmallDictionary Error', $e);
+        }
+    }
+
+    public function addWord(string $word, string $category = 'B1_B2'): bool 
+    {
+        try {
+            $allowedCategories = ['B1_B2', 'C1_PLUS', 'GRAMMAR', 'BUSINESS'];
+            if (!in_array($category, $allowedCategories, true)) {
+                $category = 'B1_B2';
+            }
+
+            $itemType = ($category === 'GRAMMAR' || str_contains($word, ':') || str_contains($word, '(')) 
+                ? 'grammar_rule' 
+                : 'word';
+
+            // ИСПРАВЛЕНИЕ: Не сбрасываем статус mastered на new
+            $stmt = $this->db->prepare("
+                INSERT INTO dictionary_master (language_code, item_type, term, category, status) 
+                VALUES (:lang, :item_type, :term, :category, 'new')
+                ON DUPLICATE KEY UPDATE status = IF(status = 'mastered', status, 'new')
+            ");
+            $stmt->execute([
+                ':lang'      => $this->languageCode,
+                ':item_type' => $itemType,
+                ':term'      => trim($word),
+                ':category'  => $category
+            ]);
+            $this->rebuildSmallDictionary();
+            return true;
+        } catch (\Throwable $e) {
+            $this->logError('addWord Error', $e);
+            return false;
+        }
+    }
+
+    private function addToSmallDict(array $masterIds): void 
+    {
+        if (empty($masterIds)) return;
+        
+        $wasInTransaction = $this->db->inTransaction();
+        if (!$wasInTransaction) {
+            $this->db->beginTransaction();
+        }
+        
+        try {
+            $stmtSmall = $this->db->prepare("INSERT IGNORE INTO dictionary_small (master_id, score) VALUES (:master_id, 0)");
+            $stmtMaster = $this->db->prepare("UPDATE dictionary_master SET status = 'learning', last_practiced_at = NOW() WHERE id = :id");
+
+            foreach ($masterIds as $id) {
+                $idInt = (int)$id;
+                $stmtSmall->execute([':master_id' => $idInt]);
+                $stmtMaster->execute([':id' => $idInt]);
+            }
+            
+            if (!$wasInTransaction && $this->db->inTransaction()) {
+                $this->db->commit();
+            }
+        } catch (\Throwable $e) {
+            if (!$wasInTransaction && $this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            $this->logError('addToSmallDict failed', $e);
+        }
+    }
+
+    private function selectOldestPracticedViaAi(array $candidates, int $needed): array 
+    {
+        $validCandidateIds = array_map('intval', array_column($candidates, 'id'));
+
+        if (!$this->aiService) {
+            return array_slice($validCandidateIds, 0, $needed);
+        }
+
+        $prompt = "From the following list, select exactly {$needed} terms/rules most appropriate for review in " . strtoupper($this->languageCode) . " language study (return array of IDs):\n" 
+                  . json_encode($candidates, JSON_UNESCAPED_UNICODE) . "\n"
+                  . "Respond ONLY with a strict JSON array of IDs: [1, 5, 12]";
+
+        try {
+            $response = $this->callClaudeSonnetThinkingModel("You are a language learning selector.", $prompt);
+            $clean = $this->cleanJsonOutput($response);
+            $decoded = json_decode($clean, true);
+
+            if (is_array($decoded)) {
+                $extractedIds = array_filter(array_map('intval', $decoded), fn($id) => $id > 0);
+                $filteredIds = array_values(array_intersect($extractedIds, $validCandidateIds));
+                
+                if (!empty($filteredIds)) {
+                    return array_slice($filteredIds, 0, $needed);
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logError('selectOldestPracticedViaAi failed', $e);
+        }
+
+        return array_slice($validCandidateIds, 0, $needed);
+    }
+
+    private function generateAndInjectVocabulary(int $count): void 
+    {
+        if ($count <= 0) return;
+
+        // 1. Извлекаем все имеющиеся термины
+        $stmtExisting = $this->db->prepare("SELECT LOWER(term) FROM dictionary_master WHERE language_code = :lang");
+        $stmtExisting->execute([':lang' => $this->languageCode]);
+        $existingTerms = array_fill_keys($stmtExisting->fetchAll(PDO::FETCH_COLUMN) ?: [], true);
+
+        $candidateWords = [];
+        $langUpper = strtoupper($this->languageCode);
+
+        // 2. Генерация терминов ИИ
+        if ($this->aiService) {
+            $prompt = "Generate {$count} unique actual {$langUpper} language expressions or business/work vocabulary (B2/C1 level). " .
+                      "Return a STRICT JSON array of strings: [\"term1\", \"term2\"]";
+            try {
+                $response = $this->callClaudeSonnetThinkingModel("You are a professional vocabulary generator.", $prompt);
+                $clean = $this->cleanJsonOutput($response);
+                $decoded = json_decode($clean, true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $word) {
+                        $term = trim((string)$word);
+                        if ($term !== '' && !isset($existingTerms[mb_strtolower($term)])) {
+                            $candidateWords[] = $term;
+                        }
+                    }
+                }
+            } catch (\Throwable $e) {
+                $this->logError('Vocabulary generation failed', $e);
+            }
+        }
+
+        // 3. Фолбэк список при необходимости
+        if (count($candidateWords) < $count) {
+            $fallbackEn = [
+                'work schedule', 'business meeting', 'action item', 'time management', 
+                'project scope', 'weekly report', 'deadline extension', 'meeting summary', 
+                'terms of agreement', 'budget allocation', 'performance metrics', 'key deliverables', 
+                'stakeholder update', 'risk mitigation', 'process optimization', 'resource planning'
+            ];
+
+            $fallbackPl = [
+                'harmonogram pracy', 'spotkanie biznesowe', 'potwierdzenie odbioru', 'zgodnie z umową', 
+                'zakres projektu', 'raport tygodniowy', 'termin realizacji', 'podsumowanie spotkania', 
+                'warunki współpracy', 'akceptacja budżetu', 'przełożony', 'zgłoszenie problemu', 
+                'weryfikacja danych', 'optymalizacja procesów', 'kluczowe wskaźniki', 'porządek obrad', 
+                'zarządzanie czasem', 'odpowiedzialność za zadanie', 'planowanie strategiczne'
+            ];
+
+            $fallbackList = $this->languageCode === 'pl' ? $fallbackPl : $fallbackEn;
+
+            foreach ($fallbackList as $fbTerm) {
+                if (count($candidateWords) >= $count) {
+                    break;
+                }
+                $cleanFb = trim($fbTerm);
+                if (!isset($existingTerms[mb_strtolower($cleanFb)]) && !in_array($cleanFb, $candidateWords, true)) {
+                    $candidateWords[] = $cleanFb;
+                }
+            }
+        }
+
+        // ИСПРАВЛЕНИЕ: Ограничиваем точное количество нужных слов
+        $candidateWords = array_slice($candidateWords, 0, $count);
+
+        if (empty($candidateWords)) {
+            return;
+        }
+
+        // 4. Вставка с сохраннием mastered
+        try {
+            $stmtMaster = $this->db->prepare("
+                INSERT INTO dictionary_master (language_code, item_type, term, category, status) 
+                VALUES (:lang, 'word', :term, 'BUSINESS', 'learning') 
+                ON DUPLICATE KEY UPDATE status = IF(status = 'mastered', status, 'learning')
+            ");
+            $stmtGetId = $this->db->prepare("SELECT id FROM dictionary_master WHERE language_code = :lang AND term = :term");
+            $stmtSmall = $this->db->prepare("INSERT IGNORE INTO dictionary_small (master_id, score) VALUES (:master_id, 0)");
+
+            foreach ($candidateWords as $word) {
+                $cleanTerm = trim((string)$word);
+                if ($cleanTerm === '') continue;
+
+                $stmtMaster->execute([':lang' => $this->languageCode, ':term' => $cleanTerm]);
+                
+                $stmtGetId->execute([':lang' => $this->languageCode, ':term' => $cleanTerm]);
+                $masterId = (int)$stmtGetId->fetchColumn();
+
+                if ($masterId > 0) {
+                    $stmtSmall->execute([':master_id' => $masterId]);
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logError('Vocabulary injection failed', $e);
+        }
+    }
+
+    private function runSupervisorCycle(int $supervisorRunCount, array $recentHistory = []): void 
+    {
+        $dialogRounds = [];
+        $totalMessages = count($recentHistory);
+
+        for ($i = 0; $i < $totalMessages; $i++) {
+            if (($recentHistory[$i]['role'] ?? '') === 'user') {
+                $prevAiPrompt = ($i > 0 && ($recentHistory[$i - 1]['role'] ?? '') === 'assistant') 
+                    ? $recentHistory[$i - 1]['content'] 
+                    : 'No context';
+
+                $dialogRounds[] = [
+                    'ai_prompt'     => $prevAiPrompt,
+                    'user_response' => $recentHistory[$i]['content'] ?? ''
+                ];
+            }
+        }
+
+        $last10Rounds = array_slice($dialogRounds, -10);
+        if (empty($last10Rounds)) return;
+
+        $stmtSmall = $this->db->prepare("
+            SELECT ds.id AS small_id, dm.id AS master_id, dm.term, dm.item_type, ds.score 
+            FROM dictionary_small ds 
+            JOIN dictionary_master dm ON ds.master_id = dm.id
+            WHERE dm.language_code = :lang
+        ");
+        $stmtSmall->execute([':lang' => $this->languageCode]);
+        $smallDict = $stmtSmall->fetchAll(PDO::FETCH_ASSOC);
+
+        $supervisorPrompt = "Analyze the last 10 dialog rounds of the student learning " . strtoupper($this->languageCode) . ".\n" .
+            "Each round contains 'ai_prompt' and 'user_response'.\n\n" .
+            "TASKS:\n" .
+            "1. Evaluate terms/rules from the Small Dictionary used by the student in 'user_response'. " .
+            "Return the 'small_id', 'term', 'correct_count' (+1 point each), and 'incorrect_count' (-1 point each).\n" .
+            "2. Extract real grammar, syntax, and lexical errors. KEEP 'term' STRICTLY AS THE ERROR PATTERN/PHRASE WITHOUT EXPLANATIONS OR COMMENTS.\n" .
+            "3. DETECT UNKNOWN WORDS: Find user requests to add words or statements indicating they don't know a word. Extract these as clean terms.\n\n" .
+            "Current Small Dictionary: " . json_encode($smallDict, JSON_UNESCAPED_UNICODE) . "\n\n" .
+            "Return STRICT JSON with structure:\n" .
+            "{\n" .
+            "  \"evaluations\": [{\"small_id\": 1, \"term\": \"word\", \"correct_count\": 2, \"incorrect_count\": 0}],\n" .
+            "  \"errors\": [{\"term\": \"clean error term/pattern\", \"sentence\": \"context sentence\"}],\n" .
+            "  \"explicit_unknown_words\": [\"word1\", \"word2\"]\n" .
+            "}";
+
+        try {
+            $responseRaw = $this->callClaudeSonnetThinkingModel(
+                "You are a strict language supervisor for " . strtoupper($this->languageCode) . " language.", 
+                json_encode($last10Rounds, JSON_UNESCAPED_UNICODE) . "\n\n" . $supervisorPrompt
+            );
+
+            $cleanedJson = $this->cleanJsonOutput($responseRaw);
+            $result = json_decode($cleanedJson, true);
+
+            $logPayload = [
+                'updated_at'    => date('Y-m-d H:i:s'),
+                'language_code' => $this->languageCode,
+                'run_count'     => $supervisorRunCount,
+                'is_valid_json' => is_array($result),
+                'raw_response'  => $responseRaw,
+                'parsed_data'   => $result
+            ];
+            @file_put_contents(
+                $this->supervisorLogFile, 
+                json_encode($logPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), 
+                LOCK_EX
+            );
+
+            if (is_array($result)) {
+                if (!empty($result['evaluations']) && is_array($result['evaluations'])) {
+                    $this->applyScoresAndManageMastery($result['evaluations']);
+                }
+
+                if (!empty($result['errors']) && is_array($result['errors'])) {
+                    $stmtError = $this->db->prepare("
+                        INSERT INTO error_candidates (language_code, term, context_sentence, occurrence_count, last_seen_at) 
+                        VALUES (:lang, :term, :sentence, 1, NOW())
+                        ON DUPLICATE KEY UPDATE 
+                            occurrence_count = occurrence_count + 1, 
+                            context_sentence = VALUES(context_sentence),
+                            last_seen_at = NOW()
+                    ");
+
+                    foreach ($result['errors'] as $err) {
+                        $term = '';
+                        $sentence = '';
+
+                        if (is_array($err)) {
+                            $term = $err['term'] ?? $err['error'] ?? $err['word'] ?? '';
+                            $sentence = $err['sentence'] ?? $err['context'] ?? $err['context_sentence'] ?? $term;
+                        } elseif (is_string($err)) {
+                            $term = $err;
+                            $sentence = $err;
+                        }
+
+                        $term = trim((string)$term);
+                        $sentence = trim((string)$sentence);
+
+                        if ($term !== '') {
+                            $stmtError->execute([
+                                ':lang'     => $this->languageCode,
+                                ':term'     => $term, 
+                                ':sentence' => $sentence !== '' ? $sentence : $term
+                            ]);
+                        }
+                    }
+                }
+
+                if (!empty($result['explicit_unknown_words']) && is_array($result['explicit_unknown_words'])) {
+                    foreach ($result['explicit_unknown_words'] as $word) {
+                        if (is_string($word) && trim($word) !== '') {
+                            $this->addWord(trim($word), 'B1_B2');
+                        }
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logError('Supervisor error', $e);
+        }
+
+        if ($supervisorRunCount % 3 === 0) {
+            $this->analyzePersistentErrorsAndRules();
+        }
+    }
+
+    private function applyScoresAndManageMastery(array $evaluations): void 
+    {
+        $stmtUpdateScore = $this->db->prepare("UPDATE dictionary_small SET score = :score WHERE id = :id");
+        $stmtSelectByTerm = $this->db->prepare("
+            SELECT ds.id, ds.score, ds.master_id 
+            FROM dictionary_small ds
+            JOIN dictionary_master dm ON ds.master_id = dm.id
+            WHERE dm.language_code = :lang AND LOWER(dm.term) = LOWER(:term)
+        ");
+
+        foreach ($evaluations as $eval) {
+            if (!is_array($eval)) continue;
+
+            $smallId = (int)($eval['small_id'] ?? 0);
+            $term = mb_strtolower(trim((string)($eval['term'] ?? '')), 'UTF-8');
+
+            $correctCount = max(0, (int)($eval['correct_count'] ?? 0));
+            $incorrectCount = max(0, (int)($eval['incorrect_count'] ?? 0));
+            $delta = $correctCount - $incorrectCount;
+
+            if ($delta === 0) continue;
+
+            $item = null;
+            if ($smallId > 0) {
+                $stmtCheck = $this->db->prepare("SELECT id, score, master_id FROM dictionary_small WHERE id = :id");
+                $stmtCheck->execute([':id' => $smallId]);
+                $item = $stmtCheck->fetch(PDO::FETCH_ASSOC);
+            }
+
+            if (!$item && $term !== '') {
+                $stmtSelectByTerm->execute([':lang' => $this->languageCode, ':term' => $term]);
+                $item = $stmtSelectByTerm->fetch(PDO::FETCH_ASSOC);
+            }
+
+            if ($item) {
+                $newScore = max(0, (int)$item['score'] + $delta);
+                $stmtUpdateScore->execute([':score' => $newScore, ':id' => $item['id']]);
+            }
+        }
+
+        // 🟢 ИСПРАВЛЕНИЕ: Мгновенно архивируем слова со score >= 10 по одному, не дожидаясь кучи из 8 штук
+        try {
+            $stmtMasteredItems = $this->db->prepare("
+                SELECT ds.id, ds.master_id 
+                FROM dictionary_small ds
+                JOIN dictionary_master dm ON ds.master_id = dm.id
+                WHERE dm.language_code = :lang AND ds.score >= 10
+            ");
+            $stmtMasteredItems->execute([':lang' => $this->languageCode]);
+            $masteredItems = $stmtMasteredItems->fetchAll(PDO::FETCH_ASSOC);
+
+            if (!empty($masteredItems)) {
+                $wasInTransaction = $this->db->inTransaction();
+                if (!$wasInTransaction) {
+                    $this->db->beginTransaction();
+                }
+
+                $stmtMaster = $this->db->prepare("UPDATE dictionary_master SET status = 'mastered', mastered_at = NOW() WHERE id = :master_id");
+                $stmtDelete = $this->db->prepare("DELETE FROM dictionary_small WHERE id = :id");
+
+                foreach ($masteredItems as $mItem) {
+                    $stmtMaster->execute([':master_id' => $mItem['master_id']]);
+                    $stmtDelete->execute([':id' => $mItem['id']]);
+                }
+
+                if (!$wasInTransaction && $this->db->inTransaction()) {
+                    $this->db->commit();
+                }
+
+                $this->rebuildSmallDictionary();
+            }
+        } catch (\Throwable $e) {
+            if ($this->db->inTransaction()) {
+                $this->db->rollBack();
+            }
+            $this->logError('Instant mastery update failed', $e);
+        }
+    }
+
+
+    private function analyzePersistentErrorsAndRules(): void 
+    {
+        try {
+            $stmtCand = $this->db->prepare("
+                SELECT id, term, context_sentence 
+                FROM error_candidates 
+                WHERE language_code = :lang
+                ORDER BY id ASC 
+                LIMIT 50
+            ");
+            $stmtCand->execute([':lang' => $this->languageCode]);
+            $candidates = $stmtCand->fetchAll(PDO::FETCH_ASSOC);
+
+            if (count($candidates) < 3) {
+                return;
+            }
+
+            $prompt = "Analyze the following list of student errors in " . strtoupper($this->languageCode) . " (with IDs):\n" . 
+                      json_encode($candidates, JSON_UNESCAPED_UNICODE) . "\n\n" .
+                      "TASKS:\n" .
+                      "1. Identify repeating or systemic GRAMMAR patterns.\n" .
+                      "2. Identify clear VOCABULARY/IDIOM mistakes.\n" .
+                      "3. Identify suspected TYPOS.\n" .
+                      "4. Return ALL IDs of errors that were successfully categorized or identified as typos so they can be deleted.\n\n" .
+                      "Return STRICT JSON format:\n" .
+                      "{\n" .
+                      "  \"processed_ids\": [38, 39, 41],\n" .
+                      "  \"grammar_rules\": [\"Rule description\"],\n" .
+                      "  \"vocabulary\": [\"correct phrase\"],\n" .
+                      "  \"typos\": [\"word\"]\n" .
+                      "}";
+
+            $responseRaw = $this->callClaudeSonnetThinkingModel("You are an expert linguistic error analyst.", $prompt);
+            $cleanJson = $this->cleanJsonOutput($responseRaw);
+            $result = json_decode($cleanJson, true);
+
+            if (!is_array($result)) return;
+
+            // ИСПРАВЛЕНИЕ: Предотвращаем сброс mastered
+            $stmtInsertMaster = $this->db->prepare("
+                INSERT INTO dictionary_master (language_code, item_type, term, category, status) 
+                VALUES (:lang, :item_type, :term, :category, 'new')
+                ON DUPLICATE KEY UPDATE status = IF(status = 'mastered', status, 'new')
+            ");
+
+            if (!empty($result['grammar_rules']) && is_array($result['grammar_rules'])) {
+                foreach ($result['grammar_rules'] as $rule) {
+                    $ruleStr = trim((string)$rule);
+                    if ($ruleStr !== '') {
+                        $stmtInsertMaster->execute([
+                            ':lang'      => $this->languageCode,
+                            ':item_type' => 'grammar_rule',
+                            ':term'      => $ruleStr, 
+                            ':category'  => 'GRAMMAR'
+                        ]);
+                    }
+                }
+            }
+
+            if (!empty($result['vocabulary']) && is_array($result['vocabulary'])) {
+                foreach ($result['vocabulary'] as $word) {
+                    $wordStr = trim((string)$word);
+                    if ($wordStr !== '') {
+                        $stmtInsertMaster->execute([
+                            ':lang'      => $this->languageCode,
+                            ':item_type' => 'word',
+                            ':term'      => $wordStr, 
+                            ':category'  => 'BUSINESS'
+                        ]);
+                    }
+                }
+            }
+
+            if (!empty($result['typos']) && is_array($result['typos'])) {
+                $stmtCount = $this->db->prepare("SELECT user_message_count FROM user_meta WHERE language_code = :lang");
+                $stmtCount->execute([':lang' => $this->languageCode]);
+                $currentMsgCount = (int)$stmtCount->fetchColumn();
+                
+                $stmtTypo = $this->db->prepare("
+                    INSERT INTO typo_queue (language_code, expected_word, check_at_message) 
+                    VALUES (:lang, :word, :check_at)
+                    ON DUPLICATE KEY UPDATE check_at_message = VALUES(check_at_message)
+                ");
+
+                foreach ($result['typos'] as $typo) {
+                    $typoStr = trim((string)$typo);
+                    if ($typoStr !== '') {
+                        $randomOffset = rand(4, 8);
+                        $stmtTypo->execute([
+                            ':lang'     => $this->languageCode,
+                            ':word'     => $typoStr, 
+                            ':check_at' => $currentMsgCount + $randomOffset
+                        ]);
+                    }
+                }
+            }
+
+               if (!empty($result['processed_ids']) && is_array($result['processed_ids'])) {
+                $cleanIds = array_values(array_filter(array_map('intval', $result['processed_ids']), fn($id) => $id > 0));
+                if (!empty($cleanIds)) {
+                    $placeholders = implode(',', array_fill(0, count($cleanIds), '?'));
+                    $stmtDelete = $this->db->prepare("DELETE FROM error_candidates WHERE language_code = ? AND id IN ($placeholders)");
+                    $stmtDelete->execute(array_merge([$this->languageCode], $cleanIds));
+                }
+            }
+
+
+            $this->rebuildSmallDictionary();
+
+        } catch (\Throwable $e) {
+            $this->logError('Rules analysis failed', $e);
+        }
+    }
+
+    private function processTypoQueue(int $currentMsgCount, string $userMessage): void 
+    {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT id, expected_word 
+                FROM typo_queue 
+                WHERE language_code = :lang AND check_at_message <= :msg
+            ");
+            $stmt->execute([':lang' => $this->languageCode, ':msg' => $currentMsgCount]);
+            $pending = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            if (empty($pending)) return;
+
+            $stmtDelete = $this->db->prepare("DELETE FROM typo_queue WHERE id = :id");
+
+            foreach ($pending as $item) {
+                $word = trim((string)$item['expected_word']);
+                $id = (int)$item['id'];
+
+                if ($word === '') {
+                    $stmtDelete->execute([':id' => $id]);
+                    continue;
+                }
+
+                $quotedWord = preg_quote($word, '/');
+                $pattern = '/(?<=^|[^\p{L}\p{N}])' . $quotedWord . '(?=$|[^\p{L}\p{N}])/ui';
+
+                if (preg_match($pattern, $userMessage) === 1) {
+                    $stmtDelete->execute([':id' => $id]);
+                } else {
+                    $this->addWord($word, 'B1_B2');
+                    $stmtDelete->execute([':id' => $id]);
+                }
+            }
+        } catch (\Throwable $e) {
+            $this->logError('processTypoQueue failed', $e);
+        }
+    }
+
+    private function callClaudeSonnetThinkingModel(string $systemPrompt, string $userPayload): string 
+    {
+        if (!$this->aiService || !method_exists($this->aiService, 'streamModelResponse')) {
+            return '';
+        }
+
+        $accumulator = '';
+        $this->aiService->streamModelResponse(
+            'claude-sonnet-5-5',
+            $systemPrompt,
+            [['role' => 'user', 'content' => $userPayload]],
+            [
+                'enable_thinking' => '1',
+                'thinking_level' => 'high',
+            ],
+            function($type, $chunk) use (&$accumulator) {
+                if ($type === 'text' && is_string($chunk)) {
+                    $accumulator .= $chunk;
+                }
+            },
+            '' // $sessionPath параметр
+        );
+
+        return $accumulator;
+    }
+
+    private function cleanJsonOutput(string $text): string 
+    {
+        $clean = preg_replace('/<think>.*?<\/think>/s', '', $text);
+        $clean = preg_replace('/```(?:json)?\s*([\s\S]*?)\s*```/', '$1', $clean);
+        
+        $jsonStart = strpos($clean, '[');
+        $jsonAssocStart = strpos($clean, '{');
+        
+        if ($jsonStart !== false && ($jsonAssocStart === false || $jsonStart < $jsonAssocStart)) {
+            $lastPos = strrpos($clean, ']');
+            if ($lastPos !== false) {
+                return substr($clean, $jsonStart, $lastPos - $jsonStart + 1);
+            }
+        } elseif ($jsonAssocStart !== false) {
+            $lastPos = strrpos($clean, '}');
+            if ($lastPos !== false) {
+                return substr($clean, $jsonAssocStart, $lastPos - $jsonAssocStart + 1);
+            }
+        }
+        return trim($clean);
+    }
+
+    private function logError(string $message, \Throwable $e): void
+    {
+        if (class_exists('AppLogger')) {
+            AppLogger::error('background', "DictionaryService: {$message} - " . $e->getMessage(), [
+                'file' => $e->getFile(),
+                'line' => $e->getLine()
+            ]);
+        } else {
+            error_log("[DictionaryService {$message}] " . $e->getMessage());
+        }
+    }
+
+    public function getDictionaryData(): array 
+    {
+        try {
+            $stmtMaster = $this->db->prepare("
+                SELECT id, item_type, term, category, status, mastered_at, last_practiced_at, created_at 
+                FROM dictionary_master 
+                WHERE language_code = :lang
+                ORDER BY id ASC
+            ");
+            $stmtMaster->execute([':lang' => $this->languageCode]);
+            $master = $stmtMaster->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+            $stmtBuffer = $this->db->prepare("
+                SELECT 
+                    ds.id, 
+                    ds.master_id, 
+                    dm.term, 
+                    dm.item_type,
+                    dm.category, 
+                    dm.status, 
+                    ds.score, 
+                    ds.added_at
+                FROM dictionary_small ds
+                JOIN dictionary_master dm ON ds.master_id = dm.id
+                WHERE dm.language_code = :lang
+                ORDER BY ds.id ASC
+            ");
+            $stmtBuffer->execute([':lang' => $this->languageCode]);
+            $activeBuffer = $stmtBuffer->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+            return [
+                'master'        => $master,
+                'active_buffer' => $activeBuffer
+            ];
+        } catch (\Throwable $e) {
+            $this->logError('getDictionaryData Error', $e);
+            return [
+                'master'        => [],
+                'active_buffer' => []
+            ];
+        }
+    }
+}
+
+
+--- 2. ПАРАМЕТРЫ ЗАПРОСА ---
+{
+    "model": "gemini-4-hydrogen",
+    "temperature": 0.7,
+    "system_context": "",
+    "use_web_search": false,
+    "telegram_notify": false,
+    "time_in_chat": false,
+    "set_period": false,
+    "enable_thinking": true,
+    "enable_google_search": false,
+    "enable_code_execution": false,
+    "enable_url_context": false,
+    "thinking_level": "high",
+    "thinking_budget": 11264,
+    "method": "streamModelResponse"
+}
+
+--- 3. ИСТОРИЯ СООБЩЕНИЙ ДЛЯ API ---
+[
+    {
+        "role": "user",
+        "content": "Мне нужно, что бы ты помог изминить промпт и код так, что бы ИИ присылывл ответ  не \"is_correct\": true, а колличестао правильныз использований",
+        "timestamp": "2026-11-17 02:32:42"
+    },
+    {
+        "role": "assistant",
+        "content": "В вашей реализации это завязано только на файл **`DictionaryService.php`** (в двух методах: `runSupervisorCycle` и `applyScoresAndManageMastery`). В `BaseHandler.php` ничего менять не нужно.\n\nНиже — готовые изменения.\n\n---\n\n### 1. Измените промпт в `DictionaryService.php` (метод `runSupervisorCycle`)\n\nСейчас промпт просит ИИ вернуть `is_correct: true\/false`. Нужно попросить его подсчитать количество правильных использований (и при необходимости ошибочных, чтобы сохранился штраф `-1` балл, как было задумано в `(+1 or -1 point)`).\n\nТакже важно явно указать, что считать нужно **только в репликах ученика (`user_response`)**, а не в сообщениях самого ИИ (`ai_prompt`).\n\nЗамените формирование `$supervisorPrompt` в `runSupervisorCycle`:\n\n```php\n        $supervisorPrompt = \"Analyze the last 10 dialog rounds of the student learning \" . strtoupper($this->languageCode) . \".\\n\" .\n            \"Each round contains 'ai_prompt' and 'user_response'.\\n\\n\" .\n            \"TASKS:\\n\" .\n            \"1. Evaluate terms\/rules from the Small Dictionary used by the student in 'user_response' (ignore usages in 'ai_prompt'). \" .\n            \"For each used term\/rule, count how many times the student used it correctly ('correct_count', +1 point each) \" .\n            \"and incorrectly ('incorrect_count', -1 point each). Omit terms that were not used.\\n\" .\n            \"2. Extract real grammar, syntax, and lexical errors. KEEP 'term' STRICTLY AS THE ERROR PATTERN\/PHRASE WITHOUT EXPLANATIONS OR COMMENTS.\\n\" .\n            \"3. DETECT UNKNOWN WORDS: Find user requests to add words or statements indicating they don't know a word. Extract these as clean terms.\\n\\n\" .\n            \"Current Small Dictionary: \" . json_encode($smallDict, JSON_UNESCAPED_UNICODE) . \"\\n\\n\" .\n            \"Return STRICT JSON with structure:\\n\" .\n            \"{\\n\" .\n            \"  \\\"evaluations\\\": [{\\\"term\\\": \\\"word\\\", \\\"correct_count\\\": 2, \\\"incorrect_count\\\": 0}],\\n\" .\n            \"  \\\"errors\\\": [{\\\"term\\\": \\\"clean error term\/pattern\\\", \\\"sentence\\\": \\\"context sentence\\\"}],\\n\" .\n            \"  \\\"explicit_unknown_words\\\": [\\\"word1\\\", \\\"word2\\\"]\\n\" .\n            \"}\";\n```\n\n> **Примечание:** если штрафовать за неправильные попытки (`-1`) не нужно и требуется **только** число правильных использований, уберите из промпта упоминание `incorrect_count` и оставьте в примере JSON только:\n> `\"evaluations\": [{\"term\": \"word\", \"correct_count\": 2}]`\n> Код в шаге 2 отработает корректно в обоих вариантах.\n\n---\n\n### 2. Измените обработку оценок в `DictionaryService.php` (метод `applyScoresAndManageMastery`)\n\nОбновите цикл подсчёта `$deltas`, чтобы он читал `correct_count` (и `incorrect_count`, если он есть), а также корректно приводил к нижнему регистру символы польского\/кириллического алфавита через `mb_strtolower`:\n\n```php\n    private function applyScoresAndManageMastery(array $evaluations): void \n    {\n        $deltas = [];\n        foreach ($evaluations as $eval) {\n            if (!is_array($eval)) {\n                continue;\n            }\n\n            $term = mb_strtolower(trim((string)($eval['term'] ?? '')), 'UTF-8');\n            if ($term === '') {\n                continue;\n            }\n\n            if (isset($eval['correct_count']) || isset($eval['incorrect_count'])) {\n                $correctCount = max(0, (int)($eval['correct_count'] ?? 0));\n                $incorrectCount = max(0, (int)($eval['incorrect_count'] ?? 0));\n                $delta = $correctCount - $incorrectCount;\n            } elseif (array_key_exists('is_correct', $eval)) {\n                \/\/ Запасной вариант для обратной совместимости\n                $delta = !empty($eval['is_correct']) ? 1 : -1;\n            } else {\n                $delta = 0;\n            }\n\n            if ($delta !== 0) {\n                $deltas[$term] = ($deltas[$term] ?? 0) + $delta;\n            }\n        }\n\n        $stmtSelect = $this->db->prepare(\"\n            SELECT ds.id, ds.score, ds.master_id \n            FROM dictionary_small ds\n            JOIN dictionary_master dm ON ds.master_id = dm.id\n            WHERE dm.language_code = :lang AND LOWER(dm.term) = LOWER(:term)\n        \");\n        $stmtUpdateScore = $this->db->prepare(\"UPDATE dictionary_small SET score = :score WHERE id = :id\");\n\n        foreach ($deltas as $term => $delta) {\n            if ($delta === 0) {\n                continue;\n            }\n\n            $stmtSelect->execute([':lang' => $this->languageCode, ':term' => $term]);\n            $item = $stmtSelect->fetch(PDO::FETCH_ASSOC);\n\n            if ($item) {\n                $newScore = max(0, (int)$item['score'] + $delta);\n                $stmtUpdateScore->execute([':score' => $newScore, ':id' => $item['id']]);\n            }\n        }\n```\n*(Остальная часть метода `applyScoresAndManageMastery`, отвечающая за перевод слов с `score >= 10` в статус `mastered`, остаётся без изменений.)*\n\n---\n\n### Как будет выглядеть ответ в `latest_supervisor_response.json`\n\nПосле следующего запуска супервайзера (каждые 10 сообщений) в `parsed_data` будет приходить, например, такой JSON:\n\n```json\n{\n  \"evaluations\": [\n    {\n      \"term\": \"Muszę (musisz) to twardy obowiązek\",\n      \"correct_count\": 3,\n      \"incorrect_count\": 0\n    }\n  ],\n  \"errors\": [],\n  \"explicit_unknown_words\": []\n}\n```\n\nИ слово сразу получит `+3` к `score` вместо `+1`.",
+        "reasoning_content": "**Analyzing the Request Details**\n\nI'm carefully dissecting the user's prompt. It seems they want me to modify code and a prompt, so the AI doesn't give a \"no\" answer, though there's more to understand about the desired output. I'm focusing on the implied goal.\n\n\n**Refining the Scoring Logic**\n\nI'm now zeroing in on `DictionaryService.php`, specifically the `runSupervisorCycle` and `applyScoresAndManageMastery` methods. My focus is on understanding how the AI's evaluations are currently structured, so I can adapt the output to deliver a count of correct and incorrect usages, rather than simply `is_correct: true`. I need to assess how the small dictionary is used so I can modify its output.\n\n\n**Revising Output Structure**\n\nI'm now zeroing in on the desired JSON output format, focusing on the changes needed to present a count of correct\/incorrect usages. I am revising the `applyScoresAndManageMastery` method, and will include a counter, and also consider how to integrate the explicit unknown words. The key is to provide a comprehensive evaluation, as per the new small dictionary format.\n\n\n**Clarifying Usage Counts**\n\nI'm now zeroing in on the AI's current evaluation methodology. The core issue is the AI only providing a boolean, even with multiple usages. The problem is that the user desires a count of correct usages, such as `\"correct_count\": 3`. I'm going to look at adding an `incorrect_count` for incorrect usages. I'm focusing on providing more detailed scoring.\n\n\n**Reconsidering Score Dynamics**\n\nI'm now grappling with the implications of replacing the boolean `is_correct` with usage counts. The existing code uses a `1` or `-1` system to score, and I'm reconsidering if we need *both* `correct_count` and `incorrect_count`, or if `correct_count` alone suffices. The user's specific request for a \"count of correct usages\" is guiding me. I'm focusing on preserving the scoring system's behavior when a term is used incorrectly and how to translate the existing score. It appears that `incorrect_count` may be necessary.\n\n\n**Inspecting Implementation Details**\n\nI'm now diving deeper into the nuances of the user's request. It seems they want the AI to report the count of correct usages, and I am reconsidering the best way to handle this. I am now considering if offering both `\"correct_count\"` and `\"incorrect_count\"` will satisfy this requirement. I am working on designing a backward-compatible approach that aligns with the existing scoring system. I will check for any specific details and subtleties in `DictionaryService.php`.\n\n\n**Examining Code Robustness**\n\nI'm now zeroing in on a potential issue related to case sensitivity when handling terms in Polish. Specifically, the use of `strtolower` in `DictionaryService.php` might not properly lowercase Polish characters like `Ł` and `Ż`. Using `mb_strtolower` with 'UTF-8' encoding seems like a more robust approach, but I will keep the change focused. I am also assessing how evaluations are structured in `runSupervisorCycle`, noting that the prompt itself is capitalized.\n\n\n**Evaluating Task Implications**\n\nI'm now carefully examining the existing tasks to ensure I incorporate all required functionality. Specifically, Task 1, which awards +1 or -1 points, will now guide how I include correct and incorrect usage counts. I'm focusing on aligning the output with the new scoring logic.\n\n**Refining Task Instructions**\n\nI'm now revising Task 1 based on my review of the `user_response` vs. `ai_prompt` distinction. The focus is now on ensuring the student's usages are counted, specifying \"across the 10 rounds.\" I am considering how to handle the optionality of `incorrect_count` in the JSON, as the existing scoring system is based on adding a score of 1 or -1. I will clarify the task's requirements to align with the new JSON structure.\n\n\n**Addressing the Negative Penalty**\n\nI'm now grappling with the implications of removing `is_correct: true` and relying solely on `correct_count`. The core problem is preserving the `-1` penalty for incorrect usages, which is integral to the existing scoring system. I'm focusing on ensuring this penalty is maintained, while updating the `applyScoresAndManageMastery()` function.\n\n\n**Visualizing New Output**\n\nI'm now focusing on how `latest_supervisor_response.json` will look post-change. I've re-examined lines 354–369 of `DictionaryService.php` to clarify the current prompt's structure. I'm visualizing the JSON output, particularly in light of the changes and additions, and I want to ensure the updates are comprehensive.\n\n\n**Adapting Scoring Mechanism**\n\nI'm now determining how to integrate `correct_count` and `incorrect_count` into the existing scoring logic, specifically the deltas. I'm focusing on preserving the integrity of the `-1` penalty for incorrect usages from the original structure.\n\n\n**Evaluating Edge Cases**\n\nI'm now focusing on handling edge cases for the new output format, especially scenarios with only `correct_count` or legacy `is_correct`. I'm verifying the scoring logic seamlessly handles these cases, including situations with a zero delta. I'm verifying the potential optimizations related to skipping database queries when the delta is zero. I'm considering all possibilities.",
+        "timestamp": "2026-11-17 02:33:20"
+    },
+    {
+        "role": "user",
+        "content": "а видиш  ли какие то ошибки в коде, что могут позжее аукнцтся",
+        "timestamp": "2026-11-17 02:36:23"
+    },
+    {
+        "role": "assistant",
+        "content": "Да, в `BaseHandler.php` и `DictionaryService.php` есть несколько логических ошибок и скрытых багов, которые со временем обязательно проявятся. Разберу от самых критичных к менее критичным.\n\n---\n\n### 1. Супервайзер и счётчик сообщений работают даже в пресетах БЕЗ словаря (`BaseHandler.php`)\nВ методах `buildSystemContext()` и `limitHistoryForModel()` вы проверяете флаг:\n```php\n$hasDictionary = (bool)($config['has_dictionary'] ?? false);\n```\nА вот в `runPostResponseTasks()` (строка 590) этой проверки **нет**:\n```php\nif ($this->dictionaryService !== null) {\n    $this->dictionaryService->handleInteraction($message, $cleanText, $fullHistory);\n}\n```\n**Чем аукнется:** Если вы заведёте обычный пресет без словаря (например, для программирования или общих вопросов, где `languageCode` по умолчанию станет `'en'`), то каждое сообщение в нём будет накручивать `user_meta`, каждые 10 сообщений запускать дорогой `claude-sonnet-5-5` и засорять ваш английский словарь терминами и «ошибками» из посторонних чатов.\n\n---\n\n### 2. Перепутаны аргументы в `buildSystemContext()` (`BaseHandler.php`)\nОбъявление метода (строка 599):\n```php\nprotected function buildSystemContext(string $sessionPath, string $summary, string $customSystemPrompt = ''): string\n```\nВызов в `sendMessage()` (строка 377):\n```php\n$systemContext = $this->buildSystemContext($sessionPath, $params['system_context'] ?? '');\n```\n**Чем аукнется:** Если в запросе передать `system_context`, он попадёт в аргумент `$summary` и приклеится как `\"КРАТКАЯ ПРЕДЫСТОРИЯ ДИАЛОГА:\\n...\"`, причём основной `system_prompt` из `config.json` не заменится, а останется ниже.\n\n---\n\n### 3. Конфликт флага `is_generating` и фоновых задач (`BaseHandler.php`)\nСейчас последовательность в `sendMessage()` такая:\n1. Клиент получает событие `done` и разблокирует ввод.\n2. Запускается `runPostResponseTasks()`, внутри него вызывается `fastcgi_finish_request()`, и PHP-скрипт ещё **10–40 секунд** ждёт ответа `claude-sonnet-5-5` для супервайзера.\n3. `setGeneratingStatus($sessionPath, false)` вызывается только в блоке `finally` — уже после окончания работы супервайзера.\n\n**Чем аукнется:**\n* Если `SessionService::isGenerating()` ориентируется на lock-файл или флаг, сбрасываемый только в `setGeneratingStatus(false)`, то пользователь, сразу отправив новое сообщение после `done`, получит отказ: `\"Сессия уже обрабатывает запрос.\"`\n* Если же `is_generating` сбрасывается раньше (в `commitAssistantMessage`), то быстрое следующее сообщение запустит второй `handleInteraction()` **параллельно** с первым — оба процесса одновременно прочитают\/изменят `user_meta` и `dictionary_small` (состояние гонки).\n\n---\n\n### 4. Зависание малого словаря из-за условия `masteredCount >= 8` (`DictionaryService.php`)\nВ `applyScoresAndManageMastery()` слова удаляются из `dictionary_small` и помечаются как `mastered` только тогда, когда **одновременно минимум 8 из 10** элементов наберут `score >= 10`.\n\n**Чем аукнется:** Если 7 слов вы уже выучили (`score = 10, 15, 30...`), а оставшиеся 3 — сложные грамматические правила, которые долго не набирают 10 баллов, то эти 7 выученных слов **застрянут в малом словаре навсегда** и будут занимать 70% слотов, не пуская новые слова. Намного надёжнее переводить в `mastered` каждое слово сразу, как только его `score >= 10` (и сразу добирать новое).\n\n---\n\n### 5. Сопоставление оценок по тексту `term`, а не по `id` (`DictionaryService.php`)\nВ `smallDict` из базы выбирается `dm.id`, но в `applyScoresAndManageMastery()` вы ищете слово обратно через:\n```sql\nWHERE dm.language_code = :lang AND LOWER(dm.term) = LOWER(:term)\n```\n**Чем аукнется:** Когда в словаре лежат длинные правила (как у вас в логе: `\"Muszę (musisz) to twardy obowiązek\"`), ИИ со временем неизбежно сократит формулировку, поменяет скобки или регистр — и оценка тихо пропадёт впустую. Надёжнее просить в JSON возвращать `id` из `smallDict` и обновлять по `dm.id` (оставив поиск по `term` как запасной вариант).\n\n---\n\n### 6. «Осиротевшая» очередь опечаток `typo_queue` (`DictionaryService.php`)\nВ классе есть метод `getPendingTyposForPrompt()`, который должен подсказывать модели, какие слова из `typo_queue` нужно спровоцировать у ученика. Но **этот метод нигде не вызывается** (в `BaseHandler::buildSystemContext()` его нет).\n\n**Чем аукнется:** Основная модель никогда не узнает, что должна подвести ученика к слову из `typo_queue`. В `check_at_message` ученик это слово с вероятностью ~95% не напишет, и `processTypoQueue()` решит, что это не опечатка, а незнакомое слово — и закинет практически все опечатки в `dictionary_master`.\n\n---\n\n### 7. Ломкий парсер `cleanJsonOutput()` (`DictionaryService.php`)\nВ `BaseHandler.php` вы очищаете и ``, и ```` ```thinking ... ``` ````. В `DictionaryService::cleanJsonOutput()` удаляется только ``, а дальше ищется первый `[` или `{` во всём тексте:\n```php\n$jsonStart = strpos($clean, '[');\n$jsonAssocStart = strpos($clean, '{');\n```\n**Чем аукнется:** Если модель перед JSON напишет любое пояснение в квадратных скобках (или они встретятся внутри ```` ```thinking ... ``` ````), например `Here is [result]: {\"evaluations\": [...]}`, то парсер вырежет кусок от `[result]` до последнего `]`, `json_decode` вернёт `null`, и весь цикл супервайзера пропадёт. При этом `supervisor_run_count` к моменту вызова модели **уже увеличен в БД**, так что пропущенный цикл уже не повторится.\n\n---\n\n### 8. Забивание очереди `error_candidates` (`DictionaryService.php`)\nВ `analyzePersistentErrorsAndRules()` всегда выбираются первые 50 записей (`ORDER BY id ASC LIMIT 50`), а удаляются только те `id`, которые ИИ вернул в `processed_ids`.\n\n**Чем аукнется:** Если какие-то ошибки ИИ не сможет классифицировать и не включит в `processed_ids`, они навсегда останутся в топе этой выборки `LIMIT 50`. Когда таких «непонятных» строк накопится 50, новые ошибки вообще перестанут доходить до анализа. (Также в `DELETE FROM error_candidates WHERE id IN (...)` желательно добавить `AND language_code = ?`).\n\n---\n\n### 9. Мелкие нюансы, о которых стоит знать\n* **Польская диакритика в MySQL (`ą\/a`, `ę\/e`, `ó\/o`, `ś\/s`, `ł\/l`):** В PHP `mb_strtolower('sąd') !== mb_strtolower('sad')`, а вот в MySQL со стандартной collation (`utf8mb4_unicode_ci` \/ `utf8mb4_0900_ai_ci`) буквы без\/с диакритикой часто считаются **одинаковыми** (accent-insensitive). Из-за этого разные польские слова могут склеиваться по `UNIQUE` ключу или ошибочно совпадать в `LOWER(dm.term) = LOWER(:term)`. Для польского лучше убедиться, что у `term` стоит `utf8mb4_polish_ci` или `utf8mb4_0900_as_ci` \/ `utf8mb4_bin`.\n* **Порядок роутинга `get_dictionary` и `add_word` (`BaseHandler.php`):** Эти два экшена находятся в `switch ($action)` **после** проверки `if (empty($session))`. Хотя сами они сессию не используют, вызвать их с фронтенда без передачи `session` нельзя — вернётся ошибка `400`.\n* **Последовательные вызовы `claude-sonnet-5-5` с `thinking_level: high` без fallback:** При срабатывании супервайзера (особенно на каждом 30-м сообщении) в одном фоновом запуске могут последовательно вызваться: `runSupervisorCycle` -> `analyzePersistentErrorsAndRules` -> `selectOldestPracticedViaAi` -> `generateAndInjectVocabulary`. Это до 4 тяжёлых запросов подряд при общем `set_time_limit(180)`, и при первом же сбое `claude-sonnet-5-5` запасной модели (в отличие от основного чата) здесь нет.",
+        "reasoning_content": "**Analyzing Potential Issues**\n\nI'm currently meticulously examining `BaseHandler.php`, `DictionaryService.php`, and `latest_supervisor_response.json`. My focus is on pinpointing actual bugs, logic flaws, race conditions, and vulnerabilities that could manifest as problems down the road. This deep dive should help mitigate risks and fortify the system's reliability.\n\n\n**Investigating Concurrent Execution**\n\nI've zeroed in on a critical concurrency concern. The asynchronous nature of `runPostResponseTasks`, especially the Claude Sonnet interaction, coupled with `fastcgi_finish_request()` and `register_shutdown_function()`, creates a race condition. Specifically, the shutdown function's `setGeneratingStatus(false)` might execute *after* a new message is received and processed, leading to inconsistent state. The potential for the next message arriving while the previous `runPostResponseTasks` is processing is a serious flaw.\n\n\n**Addressing State Discrepancy**\n\nI've confirmed the state mismatch. The `is_generating` flag remains `true` long after the client receives the \"done\" signal due to the background tasks. This is a severe problem. The `finally` block clearing this flag executes too late, leading to the misleading \"Сессия уже обрабатывает запрос.\" error message. The `runPostResponseTasks` function's extended execution time is the root cause.\n\n\n**Uncovering Race Condition**\n\nI'm now deeply concerned about a subtle race condition. The `commitAssistantMessage` function, specifically setting `$meta['is_generating'] = false;`, appears before `runPostResponseTasks`. But, if `SessionService` checks `meta.json['is_generating']`, `commitAssistantMessage` already clears it! The `finally` block's call to `setGeneratingStatus($sessionPath, false)` seems redundant, unless `SessionService` uses a different lock file. Concurrency means two requests could simultaneously run `DictionaryService::handleInteraction`, potentially leading to data corruption without row locks on `user_meta` and `dictionary_small`.\n\n\n**Examining Argument Mismatch**\n\nI've discovered a critical issue in `sendMessage`. Specifically, `buildSystemContext` is receiving incorrect arguments. The function definition expects a summary and an optional custom system prompt, but the call only passes the system context as the summary! This could lead to incorrect system context construction and unpredictable behavior. I need to understand what's intended with the system context and address this mismatch. The discrepancy might be subtle but could be impacting performance in unpredictable ways.\n\n\n**Pinpointing Unintended Behavior**\n\nI've located a major bug in `DictionaryService.php` concerning `typo_queue` and the interaction count. The `processTypoQueue` is called after incrementing the `user_message_count` but `getPendingTyposForPrompt()` is never used, which creates a critical mismatch. Furthermore, in `sendMessage`, the call to `buildSystemContext` still appends the RIIA DIALOG string and `getSystemPrompt`, instead of using `$customSystemPrompt`, potentially causing incorrect system context. The issue seems rooted in a signature mismatch in `buildSystemContext`, where the intended summary or parameters are not correctly being passed. This could lead to unpredictable behavior.\n\n\n**Identifying Dictionary Anomalies**\n\nI'm now focusing on a significant flaw within `DictionaryService`. The typo word will *never* be explicitly provided by the user at `check_at_message`. Consequently, `processTypoQueue` will invariably move typos to `dictionary_master` due to the code's current behavior. Further, I'm analyzing a specific bug, related to the interaction count, found in lines 455-488 of `DictionaryService.php`. The interaction count results in an `mb_strtolower` that doesn't match the MySQL `LOWER()` function, and the handling of duplicate terms. This also introduces issues relating to `HAVING` clauses and the potential for deadlocks concerning mastered terms below a count of eight. I'm reviewing `latest_supervisor_response.json` to confirm how `DictionaryService` sends `smallDict` to the Supervisor, and how the \"term\" field is handled in relation to potential errors.\n\n\n**Refining Data Integrity**\n\nI'm now zeroing in on a critical data integrity problem in the dictionary management. Matching terms by their lower-cased string value is problematic because LLMs might paraphrase or modify them subtly. This means that a term in `dictionary_master` will not be correctly matched. Using the database ID would be far more reliable, especially considering LLM paraphrasing. This applies to the `evaluations` process and the transfer of data between the small and master dictionaries. Also, in the `latest_supervisor_response.json`, I will investigate any errors resulting from this.\n\n\n**Evaluating Dictionary Graduation**\n\nMy focus has shifted to the `dictionary_small` graduation logic. I've realized a potential bottleneck. The rule requiring *8 out of 10* words to reach a score of 10 for promotion to `mastered` creates a scenario where 7 words could become permanently stuck in `dictionary_small`. This blocks a significant portion of the dictionary's capacity, preventing the AI from focusing on less-mastered words. This design risk needs further examination.\n\n\n**Investigating Dictionary Interactions**\n\nI'm now carefully examining the interactions between dictionary updates and session context. Specifically, I'm concerned about how the global `user_message_count` is affected across sessions. The logic in `BaseHandler.php` increments the count even when `has_dictionary` is false, and I'm concerned that these counters aren't consistently applied. The discrepancy could lead to unexpected behavior during the `runSupervisorCycle` and how the history is limited.\n\n\n**Detecting Inconsistencies**\n\nI've uncovered a crucial flaw in `BaseHandler::runPostResponseTasks`. Even when a preset has no dictionary, the system still increments the `user_meta` message count for the default language (English, in this case). This means that every message, even in presets without a dictionary, triggers English dictionary updates via Claude Sonnet and potentially pollutes it with errors. This is a severe bug, especially in coding or general assistant presets.\n\n\\n\\n\n\nI'm now investigating a security vulnerability in `DictionaryService::analyzePersistentErrorsAndRules`. Specifically, the DELETE query on `error_candidates` lacks a check for the language code. This means a hallucinated ID from a different language could be deleted, though the impact is minor.\n\n\n**Scrutinizing Error Reporting**\n\nI'm now focusing on potential blind spots in error handling, specifically within `error_candidates`. My analysis reveals a critical design flaw: unclassified errors might never be addressed if their IDs remain in the oldest 50 rows. The `analyzePersistentErrorsAndRules` function only selects the oldest IDs and not the *count* of those IDs. This could allow them to monopolize the queue, potentially hiding more recent errors. Also, I'm examining the `INSERT` query in `runSupervisorCycle` and its use of `occurrence_count`. The AI is never given feedback on the `occurrence_count` for each term. Finally, I'm inspecting the call to `claude-sonnet-5-5`.\n\n\n**Assessing Fallback Mechanisms**\n\nI'm now deeply concerned about the lack of fallback for `claude-sonnet-5-5`. A failure here skips a supervisor cycle entirely. Additionally, the pre-incremented `$supervisorRunCount` in the DB exacerbates the problem. I'm investigating the impact of a high number of sequential Claude Sonnet calls with `thinking_level: high`, which might cause cascading failures and skipped error analyses.\n\n\n**Examining Text Cleansing**\n\nI'm now focusing on a critical flaw in `DictionaryService::cleanJsonOutput`. The code might fail to properly sanitize output from the LLM when there is no explicitly declared JSON preamble, specifically the ```` ```thinking ... ``` ```` blocks that might sneak in if the model is thinking in JSON but does not declare it properly. The regex isn't robust enough to handle all variations. This may introduce malformed JSON or other unexpected data into the subsequent processing, especially when the AI is outputting a preamble before JSON like \"Here is the ...\"\n\n\n**Identifying JSON Vulnerability**\n\nI've uncovered a serious flaw in how JSON is handled. The current implementation of `cleanJsonOutput` corrupts JSON parsing within `runSupervisorCycle`, which is due to `strpos` and `strrpos` blindly parsing the structure. This issue arises from the JSON preamble, specifically the `[JSON]` prefix and the trailing `]` of the \"evaluations\" field, leading to incomplete parsing. This has significant ramifications, especially during interactions. My focus is now on ensuring proper root type parsing in relevant functions.\n\n\n**Investigating Parameter Handling**\n\nI'm now investigating a crucial parameter handling issue within `BaseHandler::handleAction`. The functions `get_dictionary` and `add_word` are called after the `session` validation, but these functions don't actually use the `$session` or `$path` parameters. They rely on `$this->dictionaryService`, using `preset` and `languageCode`. Therefore, calls to `get_dictionary` and `add_word` would work even if no `session` parameter is sent by the frontend, which seems wrong.\n\n\n**Evaluating Parameter Inconsistencies**\n\nI'm now focusing on inconsistencies in parameter handling. The `BaseHandler::handleAction` function's lack of session usage in `get_dictionary` and `add_word` calls raises questions. These functions depend on `$this->dictionaryService` and don't require the session, which might be an issue. Also, in `BaseHandler::sendMessage`, the `usleep` call in the final fallback attempt represents a minor efficiency loss. The system context in `buildSystemContext` is passed incorrectly. It is passed as the summary, not system context.\n\n\n**Investigating Term Length**\n\nI'm now analyzing potential data integrity problems relating to term lengths. Specifically, I'm examining `DictionaryService::addWord` and `rebuildSmallDictionary`. In `addWord`, I'm concerned about the `term` column in `dictionary_master` if a grammar rule, created by `analyzePersistentErrorsAndRules`, exceeds the column's length. I'm also scrutinizing the `addToSmallDict` function. If the database is in strict mode, longer terms might cause INSERT errors, silently.\n\n\n**Addressing Database Updates**\n\nI'm now examining database update discrepancies between `dictionary_master` and `dictionary_small`, specifically concerning the `last_practiced_at` flag. `generateAndInjectVocabulary` sets `dictionary_master.status` to 'learning' without updating this timestamp. This has to be resolved by ensuring that the database collations properly support diacritics, which might cause mismatching in term matching.\n\n\n**Examining Character Encoding**\n\nI'm now investigating character encoding discrepancies. The inconsistent handling of diacritics in PHP's `mb_strtolower` compared to MySQL's case-insensitive collations (like `utf8mb4_unicode_ci` and `utf8mb4_0900_ai_ci`) poses significant issues for term matching, which causes discrepancies in the system. Duplicates are handled differently in PHP and MySQL. I'm focusing on collisions when `sąd` and `sad` are treated as the same term. I need to resolve these issues.\n\n\\n\\n\n\n**Analyzing Session History**\n\nI've discovered a critical flaw in how session history interacts with the supervisor cycle. The `runSupervisorCycle` function's dependency on `$last10Rounds` (a slice from `$dialogRounds`) creates a problem when a user edits\/deletes or restarts a session. The `last10Rounds` is truncated if sessions are restarted.\n\n\n**Refining Session History**\n\nI'm now focusing on a critical interaction between session history and the supervisor cycle. Editing, deleting, or restarting a session truncates `last10Rounds`, which is crucial for `runSupervisorCycle`. Any practiced words in those initial rounds might be skipped during evaluation, which needs attention. I'm also examining the message\/round limits used by the main AI model versus the supervisor cycle and I'm looking at `latest_supervisor_response.json` for overwrites.\n\n\n**Identifying Dictionary Interaction**\n\nI've pinpointed a high-severity bug in `BaseHandler.php`. The `runPostResponseTasks` function lacks a `has_dictionary` check, which causes the message count to be incremented even in presets without a dictionary, such as the `code` preset, leading to unnecessary dictionary operations. This inefficiency has a performance impact, specifically because `claude-sonnet-5-5` is called every 10 messages.\n\n\n**Examining Data Contamination**\n\nI'm now investigating a crucial data integrity issue. Calling `claude-sonnet-5-5` with `thinking_level: high` in the background, along with the incorrect system context assignment from `sendMessage`, contaminates the English dictionary. Words and errors from non-English chats are added. This leads to polluted data.\n\n\n\n**Addressing State Synchronization**\n\nI'm now investigating a race condition involving the 'done' event, `runPostResponseTasks()`, and the state of the session. The `fastcgi_finish_request()` call and long-running Claude Sonnet interaction might mean `setGeneratingStatus(false)` executes too late. If the session checks another state indicator, a user might see an incorrect \"Сессия уже обрабатывает запрос\" error. The fact that the `is_generating` flag may be cleared before `runPostResponseTasks` makes it possible for multiple PHP processes.\n\n\n**Detecting Concurrency Issues**\n\nI'm now deeply concerned about concurrent access to `DictionaryService::handleInteraction` and its impact on `user_meta` and `dictionary_small` without locks, which creates race conditions, potentially leading to a double supervisor run on the same `user_message_count`. I'll analyze how the `applyScoresAndManageMastery` function retrieves `term` from JSON. The use of lowercase comparison for terms could cause incorrect term matching. I need to get `id` from JSON instead of a term to prevent issues.\n\n\n**Evaluating Dictionary Logic**\n\nI'm now investigating a crucial dictionary logic flaw related to the graduation criteria from `dictionary_small`. Requiring 8 out of 10 terms to reach a score of 10 to transfer to `mastered` can freeze the dictionary. This could lead to 7 words being permanently stored in the dictionary. I need to resolve this flaw. Also, the `getPendingTyposForPrompt()` method is never used with the `typo_queue`.\n\n\n**Investigating Prompt Discrepancies**\n\nI'm now examining an uncalled function: `getPendingTyposForPrompt()`, which is never triggered in `BaseHandler::buildSystemContext()`. This oversight prevents the main model from prompting the student to use terms in `typo_queue`, so the model will fail to recognize potential typos. The result is that `processTypoQueue()` moves most typos to `dictionary_master` because the student never explicitly provides the word in `check_at_message`, which is not what we want.\n\n\n\n**Refining JSON Processing**\n\nI'm now focusing on JSON sanitization flaws. The existing `cleanJsonOutput` function truncates output, leading to incomplete processing. It only extracts blocks starting with `[` or `{`, meaning an initial descriptive sentence causes the parsing to fail, resulting in a null value and a lost supervisor cycle, especially with preambles like \"Here is the [analysis]: { ... }\". This is coupled with the supervisor run count.\n\n\n**Addressing Error Analysis**\n\nI'm now investigating a critical flaw in `analyzePersistentErrorsAndRules`. Unclassified errors could monopolize the queue and block newer ones because of the older IDs. The `DELETE` query should filter by language code, and I need to solve encoding issues.",
+        "timestamp": "2026-11-17 02:37:29"
+    },
+    {
+        "role": "user",
+        "content": "предложи исправления кода",
+        "timestamp": "2026-11-17 02:38:39"
+    },
+    {
+        "role": "assistant",
+        "content": "Вот исправления для ключевых архитектурных и логических ошибок, которые мы обсудили. Они сделают систему стабильной, безопасной для пресетов без словаря и избавят от зависаний словарной логики.\n\n---\n\n### 1. Исправления в `BaseHandler.php`\n\n#### А. Защита фоновых задач для пресетов без словаря\nВ методе `runPostResponseTasks` фоновый вызов словаря происходит всегда. Исправим это, добавив проверку флага `has_dictionary` из конфига пресета.\n\nНайдите в `BaseHandler.php` метод `runPostResponseTasks` и замените его на этот:\n\n```php\nprotected function runPostResponseTasks(\n    string $sessionPath,\n    string $message,\n    string $cleanText,\n    array $fullHistory\n): void {\n    if (function_exists('fastcgi_finish_request')) {\n        fastcgi_finish_request();\n    } else {\n        if (ob_get_level() > 0) {\n            @ob_end_flush();\n        }\n        @flush();\n    }\n\n    ignore_user_abort(true);\n    set_time_limit(180);\n\n    \/\/ 🟢 ИСПРАВЛЕНИЕ: Проверяем, включен ли словарь для этого пресета\n    $config = $this->readJson($this->presetPath . 'config.json', []);\n    $hasDictionary = (bool)($config['has_dictionary'] ?? false);\n\n    if ($hasDictionary && $this->dictionaryService !== null) {\n        try {\n            $this->dictionaryService->handleInteraction($message, $cleanText, $fullHistory);\n        } catch (\\Throwable $dictEx) {\n            AppLogger::error('background', 'DictionaryService error: ' . $dictEx->getMessage(), [\n                'session' => $sessionPath\n            ]);\n        }\n    }\n\n    try {\n        $this->afterMessageSent($sessionPath);\n    } catch (\\Throwable $subEx) {\n        AppLogger::error('background', 'Supervisor Error: ' . $subEx->getMessage(), [\n            'file' => $subEx->getFile(),\n            'line' => $subEx->getLine()\n        ]);\n    }\n}\n```\n\n#### Б. Исправление порядка аргументов в `buildSystemContext` и интеграция очереди опечаток (`typo_queue`)\nИсправим путаницу с аргументами `$summary` \/ `$customSystemPrompt`, а также подключим `getPendingTyposForPrompt()`, чтобы модель знала об опечатках ученика.\n\nЗамените метод `buildSystemContext` в `BaseHandler.php` на следующий:\n\n```php\nprotected function buildSystemContext(string $sessionPath, string $customSystemPrompt = '', string $summary = ''): string\n{\n    $config = $this->readJson($this->presetPath . 'config.json', []);\n    $hasDictionary = (bool)($config['has_dictionary'] ?? false);\n\n    $systemContext = !empty($customSystemPrompt)\n        ? $customSystemPrompt\n        : $this->getSystemPrompt($sessionPath);\n\n    if ($hasDictionary && $this->dictionaryService !== null) {\n        $smallDict = $this->dictionaryService->getDictionary();\n        if (!empty($smallDict)) {\n            $systemContext .= \"\\n\\nАКТИВНЫЙ МАЛЫЙ СЛОВАРЬ (используй эти слова, правила и выражения в диалоге, проверяй их употребление. Можешь подталкивать ученика к их использованию):\\n\" .\n                              json_encode($smallDict, JSON_UNESCAPED_UNICODE);\n        }\n\n        \/\/ 🟢 ИСПРАВЛЕНИЕ: Подтягиваем опечатки\/целевые слова из typo_queue для подсказки модели\n        $pendingTypos = $this->dictionaryService->getPendingTyposForPrompt();\n        if (!empty($pendingTypos)) {\n            $systemContext .= \"\\n\\nЦЕЛЕВЫЕ СЛОВА\/ОПЕЧАТКИ ДЛЯ ПРОВЕРКИ (мягко и естественно подталкивай ученика использовать их в диалоге, если уместно):\\n\" .\n                              json_encode($pendingTypos, JSON_UNESCAPED_UNICODE);\n        }\n    }\n\n    if (!empty($summary)) {\n        $systemContext = \"КРАТКАЯ ПРЕДЫСТОРИЯ ДИАЛОГА:\\n\" . $summary . \"\\n\\n\" . $systemContext;\n    }\n\n    if ($filesContext = $this->fileService->getSessionFilesContext($sessionPath)) {\n        $systemContext .= \"\\n\\nПрикреплённые файлы:\\n\" . $filesContext;\n    }\n\n    return $systemContext;\n}\n```\n\n---\n\n### 2. Исправления в `DictionaryService.php`\n\n#### А. Переход на поиск по `id` в супервайзоре и мгновенный `mastered` статус\n1. Обновим промпт супервайзора, чтобы ИИ возвращал `id` элементов малого словаря (это защитит от изменения формулировок).\n2. Изменим логику перевода в `mastered`: теперь слово уходит в архив **сразу** при достижении `score >= 10` (а не когда накопится 8 штук), что разгрузит малый словарь.\n\nЗамените методы **`runSupervisorCycle`** и **`applyScoresAndManageMastery`** в `DictionaryService.php` на следующие:\n\n```php\n    private function runSupervisorCycle(int $supervisorRunCount, array $recentHistory = []): void \n    {\n        $dialogRounds = [];\n        $totalMessages = count($recentHistory);\n\n        for ($i = 0; $i < $totalMessages; $i++) {\n            if (($recentHistory[$i]['role'] ?? '') === 'user') {\n                $prevAiPrompt = ($i > 0 && ($recentHistory[$i - 1]['role'] ?? '') === 'assistant') \n                    ? $recentHistory[$i - 1]['content'] \n                    : 'No context';\n\n                $dialogRounds[] = [\n                    'ai_prompt'     => $prevAiPrompt,\n                    'user_response' => $recentHistory[$i]['content'] ?? ''\n                ];\n            }\n        }\n\n        $last10Rounds = array_slice($dialogRounds, -10);\n        if (empty($last10Rounds)) return;\n\n        $stmtSmall = $this->db->prepare(\"\n            SELECT ds.id AS small_id, dm.id AS master_id, dm.term, dm.item_type, ds.score \n            FROM dictionary_small ds \n            JOIN dictionary_master dm ON ds.master_id = dm.id\n            WHERE dm.language_code = :lang\n        \");\n        $stmtSmall->execute([':lang' => $this->languageCode]);\n        $smallDict = $stmtSmall->fetchAll(PDO::FETCH_ASSOC);\n\n        $supervisorPrompt = \"Analyze the last 10 dialog rounds of the student learning \" . strtoupper($this->languageCode) . \".\\n\" .\n            \"Each round contains 'ai_prompt' and 'user_response'.\\n\\n\" .\n            \"TASKS:\\n\" .\n            \"1. Evaluate terms\/rules from the Small Dictionary used by the student in 'user_response'. \" .\n            \"Return the 'small_id', 'term', 'correct_count' (+1 point each), and 'incorrect_count' (-1 point each).\\n\" .\n            \"2. Extract real grammar, syntax, and lexical errors. KEEP 'term' STRICTLY AS THE ERROR PATTERN\/PHRASE WITHOUT EXPLANATIONS OR COMMENTS.\\n\" .\n            \"3. DETECT UNKNOWN WORDS: Find user requests to add words or statements indicating they don't know a word. Extract these as clean terms.\\n\\n\" .\n            \"Current Small Dictionary: \" . json_encode($smallDict, JSON_UNESCAPED_UNICODE) . \"\\n\\n\" .\n            \"Return STRICT JSON with structure:\\n\" .\n            \"{\\n\" .\n            \"  \\\"evaluations\\\": [{\\\"small_id\\\": 1, \\\"term\\\": \\\"word\\\", \\\"correct_count\\\": 2, \\\"incorrect_count\\\": 0}],\\n\" .\n            \"  \\\"errors\\\": [{\\\"term\\\": \\\"clean error term\/pattern\\\", \\\"sentence\\\": \\\"context sentence\\\"}],\\n\" .\n            \"  \\\"explicit_unknown_words\\\": [\\\"word1\\\", \\\"word2\\\"]\\n\" .\n            \"}\";\n\n        try {\n            $responseRaw = $this->callClaudeSonnetThinkingModel(\n                \"You are a strict language supervisor for \" . strtoupper($this->languageCode) . \" language.\", \n                json_encode($last10Rounds, JSON_UNESCAPED_UNICODE) . \"\\n\\n\" . $supervisorPrompt\n            );\n\n            $cleanedJson = $this->cleanJsonOutput($responseRaw);\n            $result = json_decode($cleanedJson, true);\n\n            $logPayload = [\n                'updated_at'    => date('Y-m-d H:i:s'),\n                'language_code' => $this->languageCode,\n                'run_count'     => $supervisorRunCount,\n                'is_valid_json' => is_array($result),\n                'raw_response'  => $responseRaw,\n                'parsed_data'   => $result\n            ];\n            @file_put_contents(\n                $this->supervisorLogFile, \n                json_encode($logPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE), \n                LOCK_EX\n            );\n\n            if (is_array($result)) {\n                if (!empty($result['evaluations']) && is_array($result['evaluations'])) {\n                    $this->applyScoresAndManageMastery($result['evaluations']);\n                }\n\n                if (!empty($result['errors']) && is_array($result['errors'])) {\n                    $stmtError = $this->db->prepare(\"\n                        INSERT INTO error_candidates (language_code, term, context_sentence, occurrence_count, last_seen_at) \n                        VALUES (:lang, :term, :sentence, 1, NOW())\n                        ON DUPLICATE KEY UPDATE \n                            occurrence_count = occurrence_count + 1, \n                            context_sentence = VALUES(context_sentence),\n                            last_seen_at = NOW()\n                    \");\n\n                    foreach ($result['errors'] as $err) {\n                        $term = '';\n                        $sentence = '';\n\n                        if (is_array($err)) {\n                            $term = $err['term'] ?? $err['error'] ?? $err['word'] ?? '';\n                            $sentence = $err['sentence'] ?? $err['context'] ?? $err['context_sentence'] ?? $term;\n                        } elseif (is_string($err)) {\n                            $term = $err;\n                            $sentence = $err;\n                        }\n\n                        $term = trim((string)$term);\n                        $sentence = trim((string)$sentence);\n\n                        if ($term !== '') {\n                            $stmtError->execute([\n                                ':lang'     => $this->languageCode,\n                                ':term'     => $term, \n                                ':sentence' => $sentence !== '' ? $sentence : $term\n                            ]);\n                        }\n                    }\n                }\n\n                if (!empty($result['explicit_unknown_words']) && is_array($result['explicit_unknown_words'])) {\n                    foreach ($result['explicit_unknown_words'] as $word) {\n                        if (is_string($word) && trim($word) !== '') {\n                            $this->addWord(trim($word), 'B1_B2');\n                        }\n                    }\n                }\n            }\n        } catch (\\Throwable $e) {\n            $this->logError('Supervisor error', $e);\n        }\n\n        if ($supervisorRunCount % 3 === 0) {\n            $this->analyzePersistentErrorsAndRules();\n        }\n    }\n\n    private function applyScoresAndManageMastery(array $evaluations): void \n    {\n        $stmtUpdateScore = $this->db->prepare(\"UPDATE dictionary_small SET score = :score WHERE id = :id\");\n        $stmtSelectByTerm = $this->db->prepare(\"\n            SELECT ds.id, ds.score, ds.master_id \n            FROM dictionary_small ds\n            JOIN dictionary_master dm ON ds.master_id = dm.id\n            WHERE dm.language_code = :lang AND LOWER(dm.term) = LOWER(:term)\n        \");\n\n        foreach ($evaluations as $eval) {\n            if (!is_array($eval)) continue;\n\n            $smallId = (int)($eval['small_id'] ?? 0);\n            $term = mb_strtolower(trim((string)($eval['term'] ?? '')), 'UTF-8');\n\n            $correctCount = max(0, (int)($eval['correct_count'] ?? 0));\n            $incorrectCount = max(0, (int)($eval['incorrect_count'] ?? 0));\n            $delta = $correctCount - $incorrectCount;\n\n            if ($delta === 0) continue;\n\n            $item = null;\n            if ($smallId > 0) {\n                $stmtCheck = $this->db->prepare(\"SELECT id, score, master_id FROM dictionary_small WHERE id = :id\");\n                $stmtCheck->execute([':id' => $smallId]);\n                $item = $stmtCheck->fetch(PDO::FETCH_ASSOC);\n            }\n\n            if (!$item && $term !== '') {\n                $stmtSelectByTerm->execute([':lang' => $this->languageCode, ':term' => $term]);\n                $item = $stmtSelectByTerm->fetch(PDO::FETCH_ASSOC);\n            }\n\n            if ($item) {\n                $newScore = max(0, (int)$item['score'] + $delta);\n                $stmtUpdateScore->execute([':score' => $newScore, ':id' => $item['id']]);\n            }\n        }\n\n        \/\/ 🟢 ИСПРАВЛЕНИЕ: Мгновенно архивируем слова со score >= 10 по одному, не дожидаясь кучи из 8 штук\n        try {\n            $stmtMasteredItems = $this->db->prepare(\"\n                SELECT ds.id, ds.master_id \n                FROM dictionary_small ds\n                JOIN dictionary_master dm ON ds.master_id = dm.id\n                WHERE dm.language_code = :lang AND ds.score >= 10\n            \");\n            $stmtMasteredItems->execute([':lang' => $this->languageCode]);\n            $masteredItems = $stmtMasteredItems->fetchAll(PDO::FETCH_ASSOC);\n\n            if (!empty($masteredItems)) {\n                $wasInTransaction = $this->db->inTransaction();\n                if (!$wasInTransaction) {\n                    $this->db->beginTransaction();\n                }\n\n                $stmtMaster = $this->db->prepare(\"UPDATE dictionary_master SET status = 'mastered', mastered_at = NOW() WHERE id = :master_id\");\n                $stmtDelete = $this->db->prepare(\"DELETE FROM dictionary_small WHERE id = :id\");\n\n                foreach ($masteredItems as $mItem) {\n                    $stmtMaster->execute([':master_id' => $mItem['master_id']]);\n                    $stmtDelete->execute([':id' => $mItem['id']]);\n                }\n\n                if (!$wasInTransaction && $this->db->inTransaction()) {\n                    $this->db->commit();\n                }\n\n                $this->rebuildSmallDictionary();\n            }\n        } catch (\\Throwable $e) {\n            if ($this->db->inTransaction()) {\n                $this->db->rollBack();\n            }\n            $this->logError('Instant mastery update failed', $e);\n        }\n    }\n```\n\n#### Б. Безопасное удаление обработанных ошибок с привязкой по языку\nВ методе `analyzePersistentErrorsAndRules()` добавим фильтрацию по языку при удалении из `error_candidates`, чтобы случайно не задеть чужие записи.\n\nНайдите в `analyzePersistentErrorsAndRules()` строчку удаления:\n```php\n$stmtDelete = $this->db->prepare(\"DELETE FROM error_candidates WHERE id IN ($placeholders)\");\n```\nИ замените её на:\n```php\n$stmtDelete = $this->db->prepare(\"DELETE FROM error_candidates WHERE language_code = :lang AND id IN ($placeholders)\");\n$stmtDelete->execute(array_merge([':lang' => $this->languageCode], $cleanIds));\n```\n*(И соответственно убедитесь, что `$stmtDelete->execute($cleanIds)` заменено на передачу `$lang` вместе с массивом).*",
+        "reasoning_content": "**Analyzing the Errors**\n\nI'm currently focused on pinpointing the specific critical errors and architectural flaws within `BaseHandler.php`. I'm starting by revisiting the previous analysis. My goal is to completely grasp the user's requirements and the severity of the issues identified before proposing code changes. This is important to ensure the proposed solutions are both effective and aligned with the user's needs.\n\n\n**Prioritizing the fixes**\n\nI'm now diving into the specific issues, prioritizing them based on severity and impact. I've broken down the fixes and listed them. Right now I'm starting with the DictionaryService.php file and the issues within it. I'm focusing on the interplay between the `BaseHandler.php` and how it depends on the dictionary service.\n\n\n**Refining the Logic**\n\nI'm now zeroing in on two specific flaws within `BaseHandler.php`. First, the `runPostResponseTasks` method always attempts dictionary handling. The correction is to verify the dictionary's enablement via config, before using the `dictionaryService`. Secondly, there's an argument mismatch in `buildSystemContext`, where the `$params['system_context']` is incorrectly being passed to `$summary`. This is a critical issue.\n\n\n**Clarifying the Order**\n\nI've just been reviewing the `sendMessage()` structure and confirming the order of operations. The `finally` block *does* indeed release the generating status before background tasks run. This clarifies a critical point, and confirms the issue lies in the timing between releasing the lock and task completion. Now I'm focused on what causes the background tasks to run.\n\n\n**Confirming Execution Order**\n\nI've been meticulously examining the execution sequence within `runPostResponseTasks`. While the use of `fastcgi_finish_request()` and subsequent script continuation is as expected, I'm now verifying the seamless integration of `$isAssistantCommitted` and the `finally` block to prevent any potential race conditions, especially considering the background tasks operate on the database, not session files. I'm satisfied that its outside the `try\/catch\/finally` block.\n\n**Optimizing Mastery Logic**\n\nI am now focused on a refinement in the DictionaryService. I'm focusing on the Instant Mastery fix, rather than waiting for 8 mastered items. I'm changing the system to check if any individual items score 10 or greater, master those immediately, and rebuild the small dictionary after.\n\n\n**Enhancing Matching Criteria**\n\nI'm now revising the matching logic within `DictionaryService.php` to use the item `id` for more precise results. My plan is to modify the supervisor prompt to include small dictionary IDs, anticipating that the AI will return either the ID or the term. This shift aims to strengthen evaluation reliability by making `id` the primary matching key and `term` a fallback.\n\n**Integrating Typo Information**\n\nI'm also working on integrating pending typos into the system prompt. Specifically, I intend to update `buildSystemContext` to include the entries from `typo_queue`.\n\n\n**Implementing Robust JSON Handling**\n\nI'm now zeroing in on more enhancements for `DictionaryService.php`. I'm tackling JSON cleaning, specifically improving `cleanJsonOutput()` to handle markdown code blocks and reliably identify the outermost JSON brackets. I'm leveraging a regular expression approach for robust JSON extraction and adding graceful error handling for `json_decode` failures. I am also working on cleaning up `error_candidates` safely, specifically the `DELETE FROM error_candidates WHERE id IN (...) AND language_code = :lang`. Furthermore, I will present the fixes cleanly, grouped by file (`BaseHandler.php` and `DictionaryService.php`), along with copy-pasteable blocks or clear explanations of what to replace and why.",
+        "timestamp": "2026-11-17 02:39:05"
+    },
+    {
+        "role": "user",
+        "content": "ТАК:?\r\n      if (!empty($result['processed_ids']) && is_array($result['processed_ids'])) {\r\n                $cleanIds = array_values(array_filter(array_map('intval', $result['processed_ids']), fn($id) => $id > 0));\r\n                if (!empty($cleanIds)) {\r\n                    $placeholders = implode(',', array_fill(0, count($cleanIds), '?'));\r\n                    $stmtDelete = $this->db->prepare(\"DELETE FROM error_candidates WHERE language_code = :lang AND id IN ($placeholders)\");\r\n                    $stmtDelete->execute(array_merge([':lang' => $this->languageCode], $cleanIds));\r\n                    $stmtDelete->execute($cleanIds);\r\n                }\r\n            }",
+        "timestamp": "2026-11-17 02:42:36"
+    },
+    {
+        "role": "assistant",
+        "content": "Нет, так работать не будет — сразу упадут две ошибки PDO:\n\n1. **Смешивание `:lang` и `?`**: в одном SQL-запросе PDO запрещает смешивать именованные (`:lang`) и позиционные (`?`) параметры — будет ошибка `Invalid parameter number: mixed named and positional parameters`. Для `language_code` тоже нужно поставить `?`.\n2. **Двойной `execute`**: вторая строка `$stmtDelete->execute($cleanIds);` лишняя — её нужно удалить.\n\nВот полностью правильный вариант:\n\n```php\n            if (!empty($result['processed_ids']) && is_array($result['processed_ids'])) {\n                $cleanIds = array_values(array_filter(array_map('intval', $result['processed_ids']), fn($id) => $id > 0));\n                if (!empty($cleanIds)) {\n                    $placeholders = implode(',', array_fill(0, count($cleanIds), '?'));\n                    $stmtDelete = $this->db->prepare(\"DELETE FROM error_candidates WHERE language_code = ? AND id IN ($placeholders)\");\n                    $stmtDelete->execute(array_merge([$this->languageCode], $cleanIds));\n                }\n            }\n```\n\nТакже проверьте в `BaseHandler.php` место вызова `buildSystemContext()` (строка 377) — если вы поменяли порядок аргументов на `($sessionPath, $customSystemPrompt = '', $summary = '')`, в `sendMessage()` вызов `$this->buildSystemContext($sessionPath, $params['system_context'] ?? '')` теперь попадёт ровно туда, куда нужно (в `$customSystemPrompt`). Если же порядок аргументов не менялся, убедитесь, что он совпадает в объявлении и вызове.",
+        "reasoning_content": "**Assessing Code Snippet**\n\nI'm currently focused on the validity of that PHP code snippet. Specifically, I'm examining the conditional statement and ensuring its logic correctly handles an array of processed IDs. I need to be sure the data type checks and filtering are robust. I believe a deeper look is warranted for potential edge cases, especially related to the `array_map` and `array_filter` functions within this context.\n\n\n**Analyzing PDO Errors**\n\nI've pinpointed two critical PDO errors within that code snippet. The primary issue is a fatal error due to mixing named and positional placeholders in the prepared statement, which is a big no-no. Additionally, there's a duplicate execution of the `$stmtDelete` statement, which is redundant. My focus is now on correcting these PDO errors and ensuring a logically sound deletion process.",
+        "timestamp": "2026-11-17 02:42:51"
+    },
+    {
+        "role": "user",
+        "content": "перепроверь новые версии файлов в соответствии с твоими правками. Может я чтото забыл или недоделал",
+        "timestamp": "2026-11-17 02:45:04"
+    }
+]

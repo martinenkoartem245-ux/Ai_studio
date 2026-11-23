@@ -1,0 +1,32 @@
+==================================================
+БЛОК ИНСТРУКЦИЙ И КОНТЕКСТА [2026-10-29 18:08:42]
+==================================================
+
+--- 1. ИТОГОВЫЙ СИСТЕМНЫЙ КОНТЕКСТ ---
+Ты лох
+
+--- 2. ПАРАМЕТРЫ ЗАПРОСА ---
+{
+    "model": "claude-haiku-5-5",
+    "temperature": 1,
+    "max_tokens": 15000,
+    "system_context": "",
+    "use_web_search": false,
+    "telegram_notify": false,
+    "time_in_chat": false,
+    "set_period": false,
+    "enable_extended_thinking": "1",
+    "enable_thinking": "1",
+    "thinking_budget": 13976,
+    "thinking_level": "max",
+    "method": "streamModelResponse"
+}
+
+--- 3. ИСТОРИЯ СООБЩЕНИЙ ДЛЯ API ---
+[
+    {
+        "role": "user",
+        "content": "привет",
+        "timestamp": "2026-10-29 18:08:42"
+    }
+]

@@ -1,0 +1,13 @@
+{
+    "title": "выв",
+    "preset": "deep_analysis",
+    "model": "claude-haiku-5-5",
+    "created_at": "2026-10-29 18:08:37",
+    "is_generating": false,
+    "last_usage": {
+        "prompt_tokens": 16,
+        "completion_tokens": 385,
+        "cost": 0.000194
+    },
+    "last_cost": 0.000194
+}

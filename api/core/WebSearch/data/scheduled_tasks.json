@@ -1,0 +1,22 @@
+{
+    "task_6adf8a19ea4f65.58710486": {
+        "id": "task_6adf8a19ea4f65.58710486",
+        "session_path": "C:\\OSPanel\\home\\full-example.local\\shop\\presets_data\\sd\\sessions\\session_20261026_181117_209470\\",
+        "preset": "default",
+        "prompt": "Проверить работоспособность заметки по таймеру через 10 минут.",
+        "priority": "fast",
+        "execute_at": 1793035377,
+        "created_at": 1793034777,
+        "status": "pending"
+    },
+    "task_6adf8b93204158.87137898": {
+        "id": "task_6adf8b93204158.87137898",
+        "session_path": "C:\\OSPanel\\home\\full-example.local\\shop\\presets_data\\sd\\sessions\\session_20261026_181252_da9747\\",
+        "preset": "default",
+        "prompt": "Проверить работоспособность отложенной задачи (тест, созданный по запросу пользователя).",
+        "priority": "fast",
+        "execute_at": 1793035755,
+        "created_at": 1793035155,
+        "status": "cancelled"
+    }
+}
