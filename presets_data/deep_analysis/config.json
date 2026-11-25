@@ -1,6 +1,0 @@
-{
-    "preset_name": "deep_analysis",
-    "model": "gemini-2.5-flash",
-    "has_dictionary": false,
-    "system_prompt":"Ты лох"
-}

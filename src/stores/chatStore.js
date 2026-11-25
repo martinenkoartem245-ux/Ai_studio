@@ -574,6 +574,64 @@ export const useChatStore = defineStore('chat', () => {
     const updated = notes.value.map(n => n.id === id ? { ...n, done: !n.done } : n)
     await saveNotes(updated)
   }
+// === Редактор пресета ===
+  const isPresetEditorOpen = ref(false)
+  const editingPresetId = ref('')
+
+  function openPresetEditor(presetId) {
+    if (!presetId) return
+    editingPresetId.value = presetId
+    isPresetEditorOpen.value = true
+  }
+
+  function closePresetEditor() {
+    isPresetEditorOpen.value = false
+    editingPresetId.value = ''
+  }
+
+  async function fetchPreset(presetId) {
+    if (!presetId) return null
+    lastError.value = null
+
+    const res = await apiRequest('get_preset', {
+      method: 'GET',
+      params: { preset: presetId }
+    })
+
+    if (res && !res.error) {
+      return res.preset || res.data || res
+    }
+
+    lastError.value = res?.message || 'Не удалось загрузить данные пресета'
+    return null
+  }
+
+async function updatePreset(presetId, payload = {}) {
+  if (!presetId) return { error: true, message: 'Не указан ID пресета' }
+  lastError.value = null
+
+  const fd = new FormData()
+  fd.append('preset', presetId)
+
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== undefined && value !== null) {
+      fd.append(key, typeof value === 'boolean' ? (value ? '1' : '0') : String(value))
+    }
+  }
+
+  const res = await apiRequest('update_preset', {
+    method: 'POST',
+    body: fd
+  })
+
+  if (res && !res.error) {
+    await fetchStructure()
+    return res
+  }
+
+  lastError.value = res?.message || 'Не удалось обновить пресет'
+  return res || { error: true, message: 'Не удалось обновить пресет' }
+}
 
   return {
     isAuthorized,
@@ -628,6 +686,15 @@ export const useChatStore = defineStore('chat', () => {
     saveNotes,
     addNote,
     deleteNote,
-    toggleNoteStatus
+    toggleNoteStatus,
+
+    // Редактор пресетов
+    isPresetEditorOpen,
+    editingPresetId,
+    openPresetEditor,
+    closePresetEditor,
+    fetchPreset,
+    updatePreset,
+
   }
 })

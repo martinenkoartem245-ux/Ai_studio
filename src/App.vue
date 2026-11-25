@@ -11,7 +11,7 @@ import NewSessionModal from './components/models/NewSessionModal.vue'
 import NewPresetModal from './components/models/NewPresetModal.vue'
 import NotesModal from './components/models/NotesModal.vue'
 import AuthModal from './components/models/AuthModal.vue'
-
+import PresetEditorModal from './components/models/PresetEditorModal.vue'
 const store = useChatStore()
 
 const isDictOpen = ref(false)
@@ -87,7 +87,7 @@ onMounted(() => {
     
     <!-- Модальное окно заметок (баги, фичи, задачи) -->
     <NotesModal />
-
+    <PresetEditorModal/>
     <!-- Модальное окно авторизации/регистрации туннеля -->
     <AuthModal :is-open="!store.isAuthorized || store.isAuthModalOpen" />
 

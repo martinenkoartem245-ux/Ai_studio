@@ -5,7 +5,7 @@ import { useChatStore } from '../../stores/chatStore'
 const props = defineProps({
   isOpen: Boolean
 })
-const emit = defineEmits(['openNewPreset', 'close'])
+const emit = defineEmits(['openNewPreset', 'editPreset', 'close'])
 
 const store = useChatStore()
 const openPresets = ref({})
@@ -24,7 +24,13 @@ function isPresetOpen(presetId) {
 async function handleSelectSession(presetId, sessionId) {
   if (store.currentPreset === presetId && store.currentSession === sessionId) return
   await store.selectSession(presetId, sessionId)
-  emit('close') // Закрываем шторку на мобилке после выбора сессии
+  emit('close')
+}
+
+function handleEditPreset(preset) {
+  emit('editPreset', preset)
+  store.openPresetEditor(preset.id)
+  emit('close') // на мобилке закрываем шторку сайдбара, как при выборе сессии
 }
 
 async function handleDeletePreset(preset) {
@@ -98,6 +104,7 @@ async function handleDeleteSession(presetId, session) {
         :key="preset.id" 
         class="rounded-lg overflow-hidden group/preset"
       >
+      
         <!-- Шапка пресета -->
         <button
           type="button"
@@ -118,7 +125,18 @@ async function handleDeleteSession(presetId, session) {
             <span class="truncate">{{ preset.name || preset.id }}</span>
           </div>
 
-          <div class="flex items-center space-x-1 shrink-0 ml-1">
+         <div class="flex items-center space-x-1 shrink-0 ml-1">
+            <button
+              type="button"
+              @click.stop="handleEditPreset(preset)"
+              class="opacity-100 md:opacity-0 group-hover/preset:opacity-100 hover:text-indigo-400 text-gray-500 p-0.5 rounded transition cursor-pointer"
+              title="Редактировать пресет"
+            >
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+              </svg>
+            </button>
+
             <button
               type="button"
               @click.stop="handleDeletePreset(preset)"
@@ -154,6 +172,7 @@ async function handleDeleteSession(presetId, session) {
             >
               <span class="truncate">{{ session.name || session.id }}</span>
               <div class="flex items-center space-x-1 shrink-0 ml-1">
+              
                 <button
                   type="button"
                   @click.stop="handleDeleteSession(preset.id, session)"

@@ -181,30 +181,43 @@ class BaseHandler
         }
 
 
-        if ($action === 'create_preset') {
-            try {
-                $presetName = $request->getString('preset_name');
-                $model = $request->getString('model', 'kimi-k3');
-                $hasDict = $request->getString('has_dictionary') === '1';
+    if ($action === 'create_preset') {
+    try {
+        $presetName = $request->getString('preset_name');
+        $model = $request->getString('model', 'kimi-k3');
+        $hasDict = $request->getString('has_dictionary') === '1';
 
-                if (empty(trim($presetName))) {
-                    Response::error('Название пресета не может быть пустым', 400);
-                    return;
-                }
+        // ← новое: читаем системную инструкцию, при отсутствии — заглушка
+        $systemPrompt = trim($request->getString('system_prompt', ''));
+        if ($systemPrompt === '') {
+            $systemPrompt = "Ты — полезный ИИ-помощник.";
+        }
 
-                $result = $this->sessionService->createPreset($this->basePresetsDir, $presetName, $model, $hasDict);
-
-                Response::json([
-                    'status'     => 'success',
-                    'preset_id'  => $result['preset_id'],
-                    'session_id' => $result['session_id']
-                ]);
-            } catch (\Throwable $e) {
-                AppLogger::error('system', 'Ошибка создания пресета', ['error' => $e->getMessage()]);
-                Response::error('Ошибка создания пресета: ' . $e->getMessage(), 500);
-            }
+        if (empty(trim($presetName))) {
+            Response::error('Название пресета не может быть пустым', 400);
             return;
         }
+
+        $result = $this->sessionService->createPreset(
+            $this->basePresetsDir,
+            $presetName,
+            $model,
+            $hasDict,
+            $systemPrompt   // ← передаём дальше
+        );
+
+        Response::json([
+            'status'     => 'success',
+            'preset_id'  => $result['preset_id'],
+            'session_id' => $result['session_id']
+        ]);
+    } catch (\Throwable $e) {
+        AppLogger::error('system', 'Ошибка создания пресета', ['error' => $e->getMessage()]);
+        Response::error('Ошибка создания пресета: ' . $e->getMessage(), 500);
+    }
+    return;
+}
+
 
         if ($action === 'delete_preset') {
             try {
@@ -221,7 +234,113 @@ class BaseHandler
             }
             return;
         }
+        if ($action === 'get_preset') {
+            try {
+                if (empty($this->preset) || !is_dir($this->presetPath)) {
+                    Response::error('Пресет не найден', 404);
+                    return;
+                }
 
+                $configFile = $this->presetPath . 'config.json';
+                $config = $this->readJson($configFile, []);
+
+                // Подтянем имя из структуры, если в config.json его нет
+                if (empty($config['name'])) {
+                    $structure = $this->sessionService->getStructure($this->basePresetsDir);
+                    foreach ($structure as $p) {
+                        if (($p['id'] ?? '') === $this->preset) {
+                            $config['name'] = $p['name'] ?? $this->preset;
+                            break;
+                        }
+                    }
+                }
+
+            Response::json([
+                'status' => 'success',
+                'preset' => array_merge([
+                    'id'             => $this->preset,
+                    'name'           => $this->preset,
+                    'model'          => 'gemini-3.6-flash',
+                    'system_prompt'  => '',
+                    'has_dictionary' => false,
+                    'language'       => 'en',
+                    'history_limit'  => self::DICTIONARY_HISTORY_LIMIT,
+                    'temperature'    => 0.7,
+                ], $config)
+            ]);
+
+
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка чтения пресета', ['error' => $e->getMessage()]);
+                Response::error('Ошибка чтения пресета: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
+
+        if ($action === 'update_preset') {
+            try {
+                if (empty($this->preset) || !is_dir($this->presetPath)) {
+                    Response::error('Пресет не найден', 404);
+                    return;
+                }
+
+                $configFile = $this->presetPath . 'config.json';
+                $config = $this->readJson($configFile, []);
+
+                $name = $request->getString('name', '');
+                if ($name !== '') {
+                    $config['name'] = trim($name);
+                }
+
+                $model = $request->getString('model', '');
+                if ($model !== '') {
+                    $config['model'] = trim($model);
+                }
+
+                // system_prompt может быть очищен намеренно, поэтому проверяем наличие ключа в $_POST/$_GET
+                if (array_key_exists('system_prompt', $_POST) || array_key_exists('system_prompt', $_GET)) {
+                    $config['system_prompt'] = $request->getString('system_prompt', '');
+                }
+
+                if (array_key_exists('has_dictionary', $_POST) || array_key_exists('has_dictionary', $_GET)) {
+                    $rawDict = $request->getString('has_dictionary', '0');
+                    $config['has_dictionary'] = in_array(strtolower($rawDict), ['1', 'true', 'yes', 'on'], true);
+                }
+
+                $lang = strtolower($request->getString('language', ''));
+                if (in_array($lang, ['en', 'pl'], true)) {
+                    $config['language'] = $lang;
+                }
+
+                if (array_key_exists('history_limit', $_POST) || array_key_exists('history_limit', $_GET)) {
+                    $limit = (int)$request->getString('history_limit', (string)self::DICTIONARY_HISTORY_LIMIT);
+                    if ($limit > 0) {
+                        $config['history_limit'] = $limit;
+                    }
+                }
+                if (array_key_exists('temperature', $_POST) || array_key_exists('temperature', $_GET)) {
+                $temperature = (float)$request->getString('temperature', (string)($config['temperature'] ?? 0.7));
+                if ($temperature >= 0 && $temperature <= 2) {
+                    $config['temperature'] = $temperature;
+                }
+            }
+
+                $saved = $this->writeJson($configFile, $config);
+                if (!$saved) {
+                    Response::error('Не удалось записать config.json', 500);
+                    return;
+                }
+
+                Response::json([
+                    'status' => 'success',
+                    'preset' => array_merge(['id' => $this->preset], $config)
+                ]);
+            } catch (\Throwable $e) {
+                AppLogger::error('system', 'Ошибка обновления пресета', ['error' => $e->getMessage()]);
+                Response::error('Ошибка обновления пресета: ' . $e->getMessage(), 500);
+            }
+            return;
+        }
         $rawSession = $request->getString('session',
                         $request->getString('session_id',
                         $request->getString('sessionId',

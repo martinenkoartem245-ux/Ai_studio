@@ -1,0 +1,13 @@
+{
+    "title": "Главная сессия",
+    "preset": "preset_20261123_205106_37c4",
+    "model": "gemini-3.5-flash-lite",
+    "created_at": "2026-11-23 20:51:06",
+    "is_generating": false,
+    "last_usage": {
+        "prompt_tokens": 341,
+        "completion_tokens": 137,
+        "cost": 0.000445
+    },
+    "last_cost": 0.000445
+}

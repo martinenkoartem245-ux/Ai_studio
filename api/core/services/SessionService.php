@@ -115,10 +115,15 @@ public function getStructure(string $basePresetsDir): array {
         JsonStorage::write($metaFile, $meta);
     }
     // SessionService.php
-public function createPreset(string $basePresetsDir, string $presetName, string $model, bool $hasDictionary): array {
+public function createPreset(
+    string $basePresetsDir,
+    string $presetName,
+    string $model,
+    bool $hasDictionary,
+    string $systemPrompt = "Ты — полезный ИИ-помощник."
+): array {
     $basePresetsDir = rtrim($basePresetsDir, '/\\') . DIRECTORY_SEPARATOR;
-    
-    // Генерируем уникальное имя директории пресета
+
     $presetId = 'preset_' . date('Ymd_His') . '_' . bin2hex(random_bytes(2));
     $presetPath = $basePresetsDir . $presetId . DIRECTORY_SEPARATOR;
 
@@ -129,20 +134,22 @@ public function createPreset(string $basePresetsDir, string $presetName, string 
     }
 
     $configData = [
-        'preset_name' => $presetName,
-        'model' => $model,
-        'has_dictionary' => $hasDictionary
+        'preset_name'    => $presetName,
+        'model'          => $model,
+        'has_dictionary' => $hasDictionary,
+        'system_prompt'  => $systemPrompt,   // ← сохраняем инструкции
     ];
+
     JsonStorage::write($presetPath . 'config.json', $configData);
 
-    // Автоматически создаем первую сессию внутри нового пресета
     $sessionId = $this->createSession($presetPath, $presetId, 'Главная сессия');
 
     return [
-        'preset_id' => $presetId,
+        'preset_id'  => $presetId,
         'session_id' => $sessionId
     ];
 }
+
 public function deletePreset(string $basePresetsDir, string $presetId): bool {
         $basePresetsDir = rtrim($basePresetsDir, '/\\') . DIRECTORY_SEPARATOR;
         $presetPath = $basePresetsDir . preg_replace('/[^\p{L}\p{N}_\-]/u', '', $presetId);
