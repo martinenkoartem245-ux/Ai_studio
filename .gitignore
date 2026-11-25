@@ -11,7 +11,7 @@ node_modules
 dist
 dist-ssr
 *.local
-
+presets_data
 # Config files
 config.php
 /config/constants.php
